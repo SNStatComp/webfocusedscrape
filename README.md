@@ -9,3 +9,7 @@ More info on statistical scraping [here](https://github.com/SNStatComp/SSIG)
 - Install all required packages using 
     > pip install -r requirements.txt
 - Create a `config.yaml` file using `config_template.yaml`
+
+# Known bugs or issues
+- issue: main function only prints config, no proper functionality coded yet
+- issue: crawling module is not fully tested, test code doesn't yield results
