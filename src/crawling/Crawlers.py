@@ -6,17 +6,19 @@ from sitemap import Sitemap
 from typing import List
 import time
 
-from .crawling import ICrawler
+# from .crawling import ICrawler  # TODO: can't get relative imports to work
 
 
-class Crawler(ICrawler):
+# class Crawler(ICrawler):
+class Crawler:
     def __init__(
             self,
             start_url: str,
             target_keywords: List[str] = None,
             max_pages: int = 100,
             delay: float = 2):
-        super(Crawler, self).__init__(start_url=start_url)
+        # super(Crawler, self).__init__(start_url=start_url)
+        self.start_url = start_url
         self.target_keywords = target_keywords or []
         # TODO: maybe have base list ready for given country in config
         self.max_pages = max_pages
@@ -117,7 +119,7 @@ class Crawler(ICrawler):
 
 if __name__ == "__main__":
     crawler = Crawler(
-        start_url="https://cbs.nl",
+        start_url="https://www.cbs.nl",
         target_keywords=['werkenbij', 'vacatures', 'jobs', 'careers'],
         max_pages=10,
         delay=2
