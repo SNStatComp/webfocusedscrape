@@ -1,0 +1,17 @@
+filesystem:
+  endpoint: 
+  bucket: 
+aws:
+  access_key: 
+  secret_access_key: 
+  session_token: 
+  default_region: 
+requests:
+  timeout: 5 # In seconds 
+  default_language: English
+input:
+  input_dir: input
+  input_file:
+  input_variables:
+output:
+  output_dir: output
