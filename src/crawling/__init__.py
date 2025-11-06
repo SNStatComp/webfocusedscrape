@@ -1,2 +1,2 @@
-from .crawling.Base import ICrawler
-from .crawling.Crawlers import Crawler
+from crawling.Base import ICrawler
+from crawling.Crawlers import Crawler

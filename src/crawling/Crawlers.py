@@ -6,11 +6,10 @@ from sitemap import Sitemap
 from typing import List
 import time
 
-# from .crawling import ICrawler  # TODO: can't get relative imports to work
+from crawling import ICrawler
 
 
-# class Crawler(ICrawler):
-class Crawler:
+class Crawler(ICrawler):
     def __init__(
             self,
             start_url: str,
