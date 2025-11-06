@@ -95,9 +95,6 @@ if __name__ == "__main__":
 
     for url in urls:
         fetcher.fetch(url)
-
-    # save results in output
-    
-    for url, html in fetcher.get_results().items():
-        print(f"\nURL: {url}")
-        print("..." + html[:100] + "...")
+        for html in fetcher.get_results().values():
+            print(f"\nURL: {url}")
+            print("..." + html[:100] + "...")
