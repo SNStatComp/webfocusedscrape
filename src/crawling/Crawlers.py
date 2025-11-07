@@ -2,7 +2,7 @@ import requests
 from urllib.parse import urljoin, urlparse
 from bs4 import BeautifulSoup
 from urllib.robotparser import RobotFileParser
-from sitemap import Sitemap
+from usp.tree import sitemap_tree_for_homepage
 from typing import List
 import time
 
@@ -15,23 +15,40 @@ class Crawler(ICrawler):
             start_url: str,
             target_keywords: List[str] = None,
             max_pages: int = 100,
-            delay: float = 2):
-        # super(Crawler, self).__init__(start_url=start_url)
-        self.start_url = start_url
+            use_robots_delay: bool = True,
+            set_delay: int = None):
+        """
+        :param start_url: the URL from which to start the crawl
+        :param target_keywords: list of keywords required to be in the url for focused scrape, defaults to no keywords
+        :param max_pages: maximum number of pages to crawl
+        :param use_robots_delay: set delay according to robots.txt, if available
+        :param set_delay: use given delay regardless of robots.txt
+        """
+        super(Crawler, self).__init__(start_url=start_url)
+
         self.target_keywords = target_keywords or []
         # TODO: maybe have base list ready for given country in config
         self.max_pages = max_pages
-        self.delay = delay
-        self.domain = urlparse(start_url).netloc
+        self.domain = urlparse(start_url).netloc  # obtain domain from start_url
         self.visited = set()
         self.results = set()
+
+        # use a Parser for robots.txt
         self.robots_parser = RobotFileParser()
         self.robots_parser.set_url(f"https://{self.domain}/robots.txt")
         self.robots_parser.read()
 
+        # set delay, defaults to 2
+        self.delay = 2
+        if set_delay is not None:
+            self.delay = set_delay
+        elif use_robots_delay:  # only if set_delay is None
+            delay_robot = self.robots_parser.crawl_delay("*")
+            if delay_robot is not None:
+                self.delay = delay_robot
+
     def is_allowed(self, url: str) -> bool:
         """Check if crawling the URL is allowed by robots.txt"""
-        # parsed = urlparse(url)  # TODO: check this out again
         return self.robots_parser.can_fetch("*", url)
 
     def is_target(self, url: str) -> bool:
@@ -57,10 +74,9 @@ class Crawler(ICrawler):
 
     def get_sitemap_urls(self) -> List[str]:
         """Get URLs from the sitemap if available"""
-        sitemap_url = f"https://{self.domain}/sitemap.xml"
         try:
-            sitemap = Sitemap(sitemap_url)
-            return [loc for loc in sitemap]
+            tree = sitemap_tree_for_homepage(self.start_url)
+            return [page.url for page in tree.all_pages()]
         except Exception as e:
             print(f"Could not fetch sitemap: {e}")
             return []
@@ -120,8 +136,7 @@ if __name__ == "__main__":
     crawler = Crawler(
         start_url="https://www.cbs.nl",
         target_keywords=['werkenbij', 'vacatures', 'jobs', 'careers'],
-        max_pages=10,
-        delay=2
+        max_pages=10
     )
     crawler.crawl()
     print("Found URLs:")
