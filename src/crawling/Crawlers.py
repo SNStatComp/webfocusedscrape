@@ -5,6 +5,7 @@ from urllib.robotparser import RobotFileParser
 from usp.tree import sitemap_tree_for_homepage
 from typing import List
 import time
+import logging
 
 from crawling import ICrawler
 
@@ -14,21 +15,36 @@ class Crawler(ICrawler):
             self,
             start_url: str,
             target_keywords: List[str] = None,
-            max_pages: int = 100,
+            max_crawl_pages: int = 100,
             use_robots_delay: bool = True,
-            set_delay: int = None):
+            set_delay: int = None,
+            add_sitemapurls: bool = True):
         """
+        Crawler class for obtaining urls from start_url.
+        Crawler will look for urls on start_url and append them to list. It will then
+            look for urls in the next item on the list and append urls to the end of the list. 
+        Once the max_crawl_pages is visited, crawl stops.
+
+        Can be used for a focused crawl if target_keywords are given.
+        If sitemap is also to be checked for urls, set add_sitemapurls = True
+        If sitemaps should be used exclusively, set max_crawl_pages = 0 or 
+            use get_sitemap_urls() directly
+
         :param start_url: the URL from which to start the crawl
         :param target_keywords: list of keywords required to be in the url for focused scrape, defaults to no keywords
         :param max_pages: maximum number of pages to crawl
         :param use_robots_delay: set delay according to robots.txt, if available
         :param set_delay: use given delay regardless of robots.txt
+        :param add_sitemapurls: True if urls from sitemap are added to crawl
         """
         super(Crawler, self).__init__(start_url=start_url)
 
-        self.target_keywords = target_keywords or []
+        self.target_keywords = [] if target_keywords is None else target_keywords
         # TODO: maybe have base list ready for given country in config
-        self.max_pages = max_pages
+
+        self.max_crawl_pages = max_crawl_pages
+        self.add_sitemapurls = add_sitemapurls
+
         self.domain = urlparse(start_url).netloc  # obtain domain from start_url
         self.visited = set()
         self.results = set()
@@ -53,7 +69,7 @@ class Crawler(ICrawler):
 
     def is_target(self, url: str) -> bool:
         """Check if the URL matches the target keywords in subdomain or path"""
-        if not self.target_keywords:
+        if len(self.target_keywords) == 0:
             return True  # No filtering if no keywords
 
         parsed = urlparse(url)
@@ -78,7 +94,7 @@ class Crawler(ICrawler):
             tree = sitemap_tree_for_homepage(self.start_url)
             return [page.url for page in tree.all_pages()]
         except Exception as e:
-            print(f"Could not fetch sitemap: {e}")
+            logging.warning(f"Could not fetch sitemap: {e}")
             return []
 
     def crawl(self):
@@ -86,7 +102,7 @@ class Crawler(ICrawler):
         queue = [self.start_url]
         self.visited.add(self.start_url)
 
-        while queue and len(self.visited) < self.max_pages:
+        while queue and len(self.visited) <= self.max_crawl_pages:
             current_url = queue.pop(0)
             if not self.is_allowed(current_url):
                 continue
@@ -95,7 +111,7 @@ class Crawler(ICrawler):
                 continue
 
             self.results.add(current_url)
-            print(f"Crawling: {current_url}")
+            logging.debug(f"Crawling: {current_url}")
 
             try:
                 response = requests.get(current_url, timeout=10)
@@ -117,15 +133,19 @@ class Crawler(ICrawler):
                 time.sleep(self.delay)
 
             except Exception as e:
-                print(f"Error crawling {current_url}: {e}")
+                logging.error(f"Error crawling {current_url}: {e}")
+        
+        logging.info(f"Crawl led to {len(self.results)} results.")
 
         # Optionally extract sitemap URLs
-        sitemap_urls = self.get_sitemap_urls()
-        for url in sitemap_urls:
-            if url not in self.visited and self.is_allowed(url):
-                self.visited.add(url)
-                self.results.add(url)
-                print(f"Adding from sitemap: {url}")
+        if self.add_sitemapurls:
+            sitemap_urls = self.get_sitemap_urls()
+            for url in sitemap_urls:
+                if url not in self.visited and self.is_allowed(url) and self.is_target(url):
+                    self.visited.add(url)
+                    self.results.add(url)
+                    logging.debug(f"Adding from sitemap: {url}")
+            logging.info(f"Sitemap raised number of results to {len(self.results)}.")
 
     def get_results(self) -> List[str]:
         """Return the set of URLs that matched the target criteria"""
@@ -133,12 +153,15 @@ class Crawler(ICrawler):
 
 
 if __name__ == "__main__":
+    logging.basicConfig(level=logging.DEBUG)
+
     crawler = Crawler(
         start_url="https://www.cbs.nl",
         target_keywords=['werkenbij', 'vacatures', 'jobs', 'careers'],
-        max_pages=10
+        max_crawl_pages=20,
+        add_sitemapurls=False
     )
     crawler.crawl()
-    print("Found URLs:")
-    for url in crawler.get_results():
-        print(url)
+    # print("Found URLs:")
+    # for url in crawler.get_results():
+    #     print(url)
