@@ -1,2 +1,3 @@
 from crawling.Base import ICrawler
-from crawling.Crawlers import Crawler
+from crawling.Crawler import Crawler
+from crawling.HesitantCrawler import HesitantCrawler

@@ -6,8 +6,9 @@ from usp.tree import sitemap_tree_for_homepage
 from typing import List
 import time
 import logging
+import re
 
-from crawling import ICrawler
+from .Base import ICrawler
 
 
 class Crawler(ICrawler):
@@ -78,12 +79,12 @@ class Crawler(ICrawler):
 
         # Check for keywords in subdomain
         for keyword in self.target_keywords:
-            if keyword in subdomain:
+            if re.search(keyword, subdomain) is not None:
                 return True
 
         # Check for keywords in path
         for keyword in self.target_keywords:
-            if keyword in path:
+            if re.search(keyword, path) is not None:
                 return True
 
         return False
@@ -97,44 +98,58 @@ class Crawler(ICrawler):
             logging.warning(f"Could not fetch sitemap: {e}")
             return []
 
-    def crawl(self):
+    def visitUrl(self, queue, url):
+        logging.debug(f"Visiting: {url}")
+        self.visited.add(url)
+
+        try:
+            response = requests.get(url, timeout=10)
+            if response.status_code != 200:
+                logging.debug(f"Exited with response status: {response.status_code}")
+                return
+
+            soup = BeautifulSoup(response.text, "html.parser")
+
+            # Extract internal links
+            for link in soup.find_all("a", href=True):
+                href = link["href"]
+                absolute_url = urljoin(url, href)
+                parsed = urlparse(absolute_url)
+
+                if parsed.netloc == self.domain and absolute_url not in self.visited:
+                    queue.append(absolute_url)                        
+
+            # Respect crawl delay
+            time.sleep(self.delay)
+
+        except Exception as e:
+            logging.error(f"Error crawling {url}: {e}")
+
+    def crawl(self, targeted=True):
         """Main crawling function"""
         queue = [self.start_url]
-        self.visited.add(self.start_url)
 
         while queue and len(self.visited) <= self.max_crawl_pages:
+            #logging.debug(f"Queue size at start of iter: {len(queue)}")
             current_url = queue.pop(0)
-            if not self.is_allowed(current_url):
+            if current_url in self.visited:
+                continue
+            # Do not revisit pages
+            #logging.debug(f"Crawling: {current_url}")
+            
+            # Continue iff url is allowed (or start url)
+            if not (self.is_allowed(current_url) or current_url == self.start_url):
+                logging.debug(f"{current_url} is not allowed")
                 continue
 
-            if not self.is_target(current_url):
+            # Continue if url is target (or start url) when crawl is targeted
+            if not (self.is_target(current_url) or current_url == self.start_url) and targeted:
+                logging.debug(f"{current_url} is not allowed")
                 continue
-
+            
+            self.visitUrl(queue, current_url)
             self.results.add(current_url)
-            logging.debug(f"Crawling: {current_url}")
 
-            try:
-                response = requests.get(current_url, timeout=10)
-                if response.status_code != 200:
-                    continue
-
-                soup = BeautifulSoup(response.text, "html.parser")
-
-                # Extract internal links
-                for link in soup.find_all("a", href=True):
-                    href = link["href"]
-                    absolute_url = urljoin(current_url, href)
-                    parsed = urlparse(absolute_url)
-                    if parsed.netloc == self.domain and absolute_url not in self.visited:
-                        self.visited.add(absolute_url)
-                        queue.append(absolute_url)
-
-                # Respect crawl delay
-                time.sleep(self.delay)
-
-            except Exception as e:
-                logging.error(f"Error crawling {current_url}: {e}")
-        
         logging.info(f"Crawl led to {len(self.results)} results.")
 
         # Optionally extract sitemap URLs
@@ -155,13 +170,24 @@ class Crawler(ICrawler):
 if __name__ == "__main__":
     logging.basicConfig(level=logging.DEBUG)
 
+    # TODO store keywords in an optimal way for both language and topic
+    # TODO always store keywords as regex? or "regex-ify" keywords?
+    keywords = [
+            "werk(en)?-?bij",
+            "vacature(s)?",
+            "job(s)?",
+            "career(s)?"
+            "cari(e|è)re"
+            "collega"
+            "versterk"
+        ]
+
     crawler = Crawler(
         start_url="https://www.cbs.nl",
-        target_keywords=['werkenbij', 'vacatures', 'jobs', 'careers'],
+        target_keywords=keywords,
         max_crawl_pages=20,
         add_sitemapurls=False
     )
-    crawler.crawl()
-    # print("Found URLs:")
-    # for url in crawler.get_results():
-    #     print(url)
+    crawler.crawl(targeted=True)
+    print("#Found URLs:", len(crawler.get_results()))
+    print("Found URLs:", crawler.get_results())
