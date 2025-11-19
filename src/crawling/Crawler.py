@@ -7,6 +7,7 @@ from typing import List
 import time
 import logging
 import re
+from frozendict import frozendict
 
 from .Base import ICrawler
 
@@ -16,7 +17,7 @@ class Crawler(ICrawler):
             self,
             start_url: str,
             target_keywords: List[str] = None,
-            max_crawl_pages: int = 100,
+            max_crawl_visits: int = 100,
             use_robots_delay: bool = True,
             set_delay: int = None,
             add_sitemapurls: bool = True):
@@ -24,16 +25,16 @@ class Crawler(ICrawler):
         Crawler class for obtaining urls from start_url.
         Crawler will look for urls on start_url and append them to list. It will then
             look for urls in the next item on the list and append urls to the end of the list. 
-        Once the max_crawl_pages is visited, crawl stops.
+        Once the max_crawl_visit is visited, crawl stops.
 
         Can be used for a focused crawl if target_keywords are given.
         If sitemap is also to be checked for urls, set add_sitemapurls = True
-        If sitemaps should be used exclusively, set max_crawl_pages = 0 or 
+        If sitemaps should be used exclusively, set max_crawl_visits = 0 or 
             use get_sitemap_urls() directly
 
         :param start_url: the URL from which to start the crawl
         :param target_keywords: list of keywords required to be in the url for focused scrape, defaults to no keywords
-        :param max_pages: maximum number of pages to crawl
+        :param max_crawl_visits: maximum number of pages to visit during crawl
         :param use_robots_delay: set delay according to robots.txt, if available
         :param set_delay: use given delay regardless of robots.txt
         :param add_sitemapurls: True if urls from sitemap are added to crawl
@@ -43,7 +44,7 @@ class Crawler(ICrawler):
         self.target_keywords = [] if target_keywords is None else target_keywords
         # TODO: maybe have base list ready for given country in config
 
-        self.max_crawl_pages = max_crawl_pages
+        self.max_crawl_visits = max_crawl_visits
         self.add_sitemapurls = add_sitemapurls
 
         self.domain = urlparse(start_url).netloc  # obtain domain from start_url
@@ -66,10 +67,13 @@ class Crawler(ICrawler):
 
     def is_allowed(self, url: str) -> bool:
         """Check if crawling the URL is allowed by robots.txt"""
-        return self.robots_parser.can_fetch("*", url)
+        return url == self.start_url or self.robots_parser.can_fetch("*", url)
 
     def is_target(self, url: str) -> bool:
         """Check if the URL matches the target keywords in subdomain or path"""
+        # Always permit start url
+        if url == self.start_url:
+            return True
         if len(self.target_keywords) == 0:
             return True  # No filtering if no keywords
 
@@ -124,33 +128,56 @@ class Crawler(ICrawler):
 
         except Exception as e:
             logging.error(f"Error crawling {url}: {e}")
+    
+    # Function to see if we can skip this URL during crawl
+    def checkURLSkipCriteria(self, current_url, targeted):
+        # Do not revisit pages
+        if current_url in self.visited:
+            return True
+
+        # URL is allowed (or start url)
+        if not self.is_allowed(current_url):
+            logging.debug(f"{current_url} is not allowed")
+            return True
+        
+        # URL is target (or start url) when crawl is targeted
+        if not self.is_target(current_url) and targeted:
+            logging.debug(f"{current_url} is not allowed")
+            return True
+
+        return False
+    
+    # Function to process result and if compliant, add it to the results list
+    def processResult(self, current_url, targeted):
+        # In Crawler we only do not add result if result is not target while crawling targeted
+        if targeted and not self.is_target(current_url):
+            return None
+
+        # We use a dict for result to potentially add more metadata
+        result = {
+            "url": current_url,
+            "source": "crawl",
+            "targeted": targeted
+        }
+        return result
 
     def crawl(self, targeted=True):
         """Main crawling function"""
         queue = [self.start_url]
 
-        while queue and len(self.visited) <= self.max_crawl_pages:
-            #logging.debug(f"Queue size at start of iter: {len(queue)}")
+        logging.info(f"Starting crawl of {self.start_url}..")
+        while queue and len(self.visited) <= self.max_crawl_visits:
             current_url = queue.pop(0)
-            if current_url in self.visited:
-                continue
-            # Do not revisit pages
-            #logging.debug(f"Crawling: {current_url}")
-            
-            # Continue iff url is allowed (or start url)
-            if not (self.is_allowed(current_url) or current_url == self.start_url):
-                logging.debug(f"{current_url} is not allowed")
+            if self.checkURLSkipCriteria(current_url, targeted):
                 continue
 
-            # Continue if url is target (or start url) when crawl is targeted
-            if not (self.is_target(current_url) or current_url == self.start_url) and targeted:
-                logging.debug(f"{current_url} is not allowed")
-                continue
-            
             self.visitUrl(queue, current_url)
-            self.results.add(current_url)
+            result = self.processResult(current_url, targeted)
+            if result is not None:
+                self.results.add(frozendict(result))
 
-        logging.info(f"Crawl led to {len(self.results)} results.")
+        logging.info(f"Crawl of {self.start_url} led to {len(self.visited)} visits out of maximum {self.max_crawl_visits}.")
+        logging.info(f"Crawl of {self.start_url} led to {len(self.results)} results out of {len(self.visited)} visits.")
 
         # Optionally extract sitemap URLs
         if self.add_sitemapurls:
@@ -185,7 +212,7 @@ if __name__ == "__main__":
     crawler = Crawler(
         start_url="https://www.cbs.nl",
         target_keywords=keywords,
-        max_crawl_pages=20,
+        max_crawl_visits=20,
         add_sitemapurls=False
     )
     crawler.crawl(targeted=True)
