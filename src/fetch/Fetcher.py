@@ -23,12 +23,15 @@ class Fetcher:
         }
         self.results = {}  # {url: html_content}
 
+    def resetResults(self):
+        self.results = {}
+        return
+
     def fetch(self, url: str) -> Dict[str, str]:
         """
         Fetches the HTML content of the given URL with retries and error handling.
         Returns a dictionary with the URL as key and the HTML content as value.
         """
-        self.results = {}  # Reset results for this call
         return self._fetch_with_retries(url)
 
     def _fetch_with_retries(self, url: str, retries: int = 0) -> Dict[str, str]:
@@ -53,7 +56,10 @@ class Fetcher:
                 return {}
 
             # Success
-            self.results[url] = response.text
+            result = {
+                "HTML": response.text,
+            }
+            self.results[url] = result
             return self.results
 
         except requests.exceptions.RequestException as e:

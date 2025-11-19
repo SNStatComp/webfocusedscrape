@@ -1,9 +1,13 @@
 from omegaconf import OmegaConf
 from util import setup
 import json
+import logging
 from datetime import datetime
 
-from fetch.Fetchers import Fetcher
+from fetch.Fetcher import Fetcher
+import crawling
+
+logging.basicConfig(level=logging.INFO)
 
 
 def main():
@@ -17,24 +21,49 @@ def main():
     print(OmegaConf.to_yaml(config))
 
     urls = [
-        "https://example.com",
-        # "https://www.cbs.nl/nl-nl/sitemaps/jobsitemap",
-        'https://www.cbs.nl/nl-nl/vacature/economisch-onderzoeker/4920ff438ef940fdaffa5dec7a8c94a2',
-        'https://www.cbs.nl/nl-nl/vacature/economisch-analist-grote-ondernemingen/f7ab83e489d4428f8291d02947c2f13a',
-        'https://www.cbs.nl/nl-nl/vacature/software-ontwikkelaar/1ae1a790f9284748aca2b34da8cae607',
-        'https://www.cbs.nl/nl-nl/vacature/onderzoeker-doodsoorzakenstatistiek/e1effbdcc57f47579a530beb5b39ffb6',
-        'https://www.cbs.nl/nl-nl/vacature/financieel-analist/2bb9b2473bcd43f481969dba5f298400'
+        "https://cbs.nl",
+        "https://duo.nl",
+        "https://belastingdienst.nl"
     ]
 
+    # TODO move to separately passed input
+    # TODO always store keywords as regex? or "regex-ify" keywords?
+    keywords = [
+            "werk(en)?-?bij",
+            "vacature(s)?",
+            "job(s)?",
+            "career(s)?"
+            "cari(e|è)re"
+            "collega"
+            "versterk"
+        ]
+
     fetcher = Fetcher()
-    for _url in urls:
-        fetcher.fetch(url=_url)
+    for baseURL in urls:
+        # crawl url
+        urlCrawler = crawling.HesitantCrawler(
+            start_url=baseURL,
+            target_keywords=keywords,
+            max_crawl_visits=100,
+            add_sitemapurls=False,
+            hesitancy=2
+        )
+
+        urlCrawler.crawl(baseURL)
+        crawledResults = urlCrawler.get_results()
+
+        for crawledResult in crawledResults:
+            fetcher.fetch(url=crawledResult["url"])
+        
     data = fetcher.get_results()
+    print("Data:", data.keys())
+
+    logging.info(f"#Fetcher results: {len(data.keys())} for {len(urls)} base URLs")
 
     filepath = f"{config.output.output_dir}/{datetime.now().strftime('%Y%m%d_%H%M%S')}fetched.jsonl"
-    with open(filepath, 'w', encoding='utf-8') as file_out:
-        for _url, _html in data.items():
-            file_out.write(json.dumps({'URL': _url, 'HTML': _html}))
+    with open(filepath, 'a', encoding='utf-8') as file_out:
+        for _url, result in data.items():
+            file_out.write(json.dumps({'URL': _url, 'HTML': result["HTML"]}))
 
 
 if __name__ == "__main__":
