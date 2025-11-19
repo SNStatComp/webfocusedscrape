@@ -56,7 +56,10 @@ class Fetcher:
                 return {}
 
             # Success
-            self.results[url] = response.text
+            result = {
+                "HTML": response.text,
+            }
+            self.results[url] = result
             return self.results
 
         except requests.exceptions.RequestException as e:
