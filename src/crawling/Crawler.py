@@ -197,8 +197,6 @@ class Crawler(ICrawler):
 if __name__ == "__main__":
     logging.basicConfig(level=logging.DEBUG)
 
-    # TODO store keywords in an optimal way for both language and topic
-    # TODO always store keywords as regex? or "regex-ify" keywords?
     keywords = [
             "werk(en)?-?bij",
             "vacature(s)?",
