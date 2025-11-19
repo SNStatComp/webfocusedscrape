@@ -27,6 +27,7 @@ def main():
     ]
 
     # TODO move to separately passed input
+    # TODO always store keywords as regex? or "regex-ify" keywords?
     keywords = [
             "werk(en)?-?bij",
             "vacature(s)?",
