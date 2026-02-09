@@ -1,0 +1,1 @@
+from extract.Extractor import MainContentExtractor
