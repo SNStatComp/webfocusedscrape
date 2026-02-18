@@ -47,8 +47,11 @@ def main():
         
     data = fetcher.get_results()
     print("Data:", data.keys())
-
     logging.info(f"#Fetcher results: {len(data.keys())} for {len(urls)} base URLs")
+
+    # TODO: add extract
+    # TODO: improve output flow, use parquet?
+    extractor = MainContentExtractor()
 
     filepath = f"{config.output.output_dir}/{datetime.now().strftime('%Y%m%d_%H%M%S')}fetched.jsonl"
     with open(filepath, 'a', encoding='utf-8') as file_out:
