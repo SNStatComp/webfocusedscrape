@@ -10,8 +10,10 @@ requests:
   timeout: 5 # In seconds 
   default_language: English
 input:
-  input_dir: input
+  input_dir: ../input
   input_file:
+    urls: urls.txt
+    keywords: keywords.txt
   input_variables:
 output:
-  output_dir: output
+  output_dir: ../output

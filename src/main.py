@@ -4,44 +4,34 @@ import json
 import logging
 from datetime import datetime
 
-from fetch.Fetcher import Fetcher
-import crawling
+from fetch import Fetcher
+from crawling import HesitantCrawler
+from extract import MainContentExtractor
 
 logging.basicConfig(level=logging.INFO)
 
 
 def main():
     """
-    Fetch HTML from a given list of URLs 
+    Crawl given urls to fetch relevant content from HTML
     """
-    
-    config = setup("config/config.yaml")
+
+    config = setup("../config/config.yaml")
 
     print("Config:")
     print(OmegaConf.to_yaml(config))
 
-    urls = [
-        "https://cbs.nl",
-        "https://duo.nl",
-        "https://belastingdienst.nl"
-    ]
+    with open(f"{config.input.input_dir}/{config.input.input_files.urls}", 'r', encoding='utf-8') as file_in:
+        urls = [line.rstrip() for line in file_in]
 
-    # TODO move to separately passed input
     # TODO always store keywords as regex? or "regex-ify" keywords?
-    keywords = [
-            "werk(en)?-?bij",
-            "vacature(s)?",
-            "job(s)?",
-            "career(s)?"
-            "cari(e|è)re"
-            "collega"
-            "versterk"
-        ]
+    with open(f"{config.input.input_dir}/{config.input.input_files.keywords}", 'r', encoding='utf-8') as file_in:
+        keywords = [line.rstrip() for line in file_in]
 
     fetcher = Fetcher()
     for baseURL in urls:
         # crawl url
-        urlCrawler = crawling.HesitantCrawler(
+        urlCrawler = HesitantCrawler(
             start_url=baseURL,
             target_keywords=keywords,
             max_crawl_visits=100,
