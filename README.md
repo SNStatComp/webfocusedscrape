@@ -8,6 +8,9 @@ More info on statistical scraping [here](https://github.com/SNStatComp/SSIG)
 # Getting started
 - Install all required packages using 
     > pip install -r requirements.txt
+- Activate the environment
+- run the following command to install modules in src as packages for proper import
+    > pip install -e .
 - Create a `config.yaml` file using `config_template.yaml`
 
 # Known bugs and work in progress
