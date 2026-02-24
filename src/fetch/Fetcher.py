@@ -90,7 +90,7 @@ if __name__ == "__main__":
     )
 
     urls = [
-        "https://example.com",
+        # "https://example.com",
         # "https://www.cbs.nl/nl-nl/sitemaps/jobsitemap",
         'https://www.cbs.nl/nl-nl/vacature/economisch-onderzoeker/4920ff438ef940fdaffa5dec7a8c94a2',
         'https://www.cbs.nl/nl-nl/vacature/economisch-analist-grote-ondernemingen/f7ab83e489d4428f8291d02947c2f13a',
@@ -103,4 +103,4 @@ if __name__ == "__main__":
         fetcher.fetch(url)
         for html in fetcher.get_results().values():
             print(f"\nURL: {url}")
-            print("..." + html[:100] + "...")
+            print(f"...{html['HTML'][:100]}...")
