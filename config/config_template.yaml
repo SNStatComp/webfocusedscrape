@@ -17,3 +17,4 @@ input:
   input_variables:
 output:
   output_dir: ../output
+  batchsize: 100
