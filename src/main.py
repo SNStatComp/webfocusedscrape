@@ -89,11 +89,16 @@ def main():
         logging.info(f"Data: {data.keys()}")
 
         for url, html in data.items():
-            buffer.append({
-                "base_url": base_url,
-                "url": url,
-                "content": extractor.extract(html=html["HTML"])
-            })
+            try:
+                buffer.append({
+                    "base_url": base_url,
+                    "url": url,
+                    "content": extractor.extract(html=html["HTML"])
+                })
+            except ValueError as e:
+                logging.info(f"Applying extractor for url {url} failed with exception: {e}")
+                logging.info("Content skipped.")
+                pass
 
             if len(buffer) >= CONFIG.output.batchsize:
                 save_batch(batch=buffer, batch_id=batch_id, dir_out=dir_out)
