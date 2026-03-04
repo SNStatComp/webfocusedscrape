@@ -17,6 +17,7 @@ class HesitantCrawler(Crawler):
             start_url: str,
             target_keywords: List[str] = None,
             max_crawl_visits: int = 100,
+            max_tries: int = 100,
             use_robots_delay: bool = True,
             set_delay: int = None,
             add_sitemapurls: bool = True,
@@ -44,6 +45,7 @@ class HesitantCrawler(Crawler):
             start_url=start_url,
             target_keywords=target_keywords,
             max_crawl_visits=max_crawl_visits,
+            max_tries=max_tries,
             use_robots_delay=use_robots_delay,
             set_delay=set_delay,
             add_sitemapurls=add_sitemapurls
@@ -55,17 +57,24 @@ class HesitantCrawler(Crawler):
         # TODO too naive? 
         return (url.count("/") + url.count("#")) - (self.start_url.count("/") + self.start_url.count("#"))
 
-    def checkURLSkipCriteria(self, current_url, targeted):
+    def checkURLSkipCriteria(self, current_url, targeted, tries_since_result):
+        # Do not revisit pages
         if current_url in self.visited:
-            return False
+            return True
         
         # Continue iff url is allowed (or start url)
         if not self.is_allowed(current_url):
             return True
 
+        # Do not visit if depth exceeds hesitancy and is not a target
+        # If we have exceeded max tries since result, also skip
         if (
-            self.estimateSiteDepth(current_url) >= self.hesitancy
-            and not self.is_target(current_url) and targeted
+            (
+                self.estimateSiteDepth(current_url) >= self.hesitancy
+                or tries_since_result > self.max_tries
+            ) and not self.is_target(current_url)
+            and (targeted or tries_since_result > self.max_tries)
+            
         ):
             return True
         
@@ -87,6 +96,7 @@ class HesitantCrawler(Crawler):
         }
 
         return result
+
 
 if __name__ == "__main__":
     logging.basicConfig(level=logging.DEBUG)

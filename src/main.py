@@ -56,15 +56,21 @@ def main():
 
     for base_url in urls:
 
-        print(f"Crawling base url: {base_url}")
-        # crawl url
-        urlCrawler = HesitantCrawler(
-            start_url=base_url,
-            target_keywords=keywords,
-            max_crawl_visits=100,
-            add_sitemapurls=False,
-            hesitancy=2
-        )
+        try:
+            # crawl url
+            urlCrawler = HesitantCrawler(
+                start_url=base_url,
+                target_keywords=keywords,
+                max_crawl_visits=100,
+                max_tries=100,  # TODO: in de CONFIG
+                add_sitemapurls=False,
+                hesitancy=2
+            )
+
+        except urllib.error.URLError as e:
+            logging.info(f"When initiating crawler, request failed with exception: {e}")
+            logging.info("Crawling skipped, continuing with next base url")
+            continue
 
         urlCrawler.crawl(base_url)
         crawledResults = urlCrawler.get_results()

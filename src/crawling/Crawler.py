@@ -7,6 +7,7 @@ from typing import List
 import time
 import logging
 import re
+import random
 from frozendict import frozendict
 
 from .Base import ICrawler
@@ -18,6 +19,7 @@ class Crawler(ICrawler):
             start_url: str,
             target_keywords: List[str] = None,
             max_crawl_visits: int = 100,
+            max_tries: int = 100,
             use_robots_delay: bool = True,
             set_delay: int = None,
             add_sitemapurls: bool = True):
@@ -45,6 +47,7 @@ class Crawler(ICrawler):
         # TODO: maybe have base list ready for given country in config
 
         self.max_crawl_visits = max_crawl_visits
+        self.max_tries = max_tries
         self.add_sitemapurls = add_sitemapurls
 
         self.domain = urlparse(start_url).netloc  # obtain domain from start_url
@@ -130,7 +133,7 @@ class Crawler(ICrawler):
             logging.error(f"Error crawling {url}: {e}")
     
     # Function to see if we can skip this URL during crawl
-    def checkURLSkipCriteria(self, current_url, targeted):
+    def checkURLSkipCriteria(self, current_url, targeted, tries_since_result):
         # Do not revisit pages
         if current_url in self.visited:
             return True
@@ -141,7 +144,7 @@ class Crawler(ICrawler):
             return True
         
         # URL is target (or start url) when crawl is targeted
-        if not self.is_target(current_url) and targeted:
+        if not self.is_target(current_url) and (targeted or tries_since_result > self.max_tries):
             logging.debug(f"{current_url} is not allowed")
             return True
 
@@ -166,16 +169,22 @@ class Crawler(ICrawler):
         queue = [self.start_url]
 
         logging.info(f"Starting crawl of {self.start_url}..")
+        tries_since_result = 0
         while queue and len(self.visited) <= self.max_crawl_visits:
             current_url = queue.pop(0)
-            if self.checkURLSkipCriteria(current_url, targeted):
+            if len(queue) > 0:
+                random.shuffle(queue)
+
+            tries_since_result += 1
+            if self.checkURLSkipCriteria(current_url, targeted, tries_since_result):
                 continue
 
             self.visitUrl(queue, current_url)
             result = self.processResult(current_url, targeted)
             if result is not None:
+                tries_since_result = 0
                 self.results.add(frozendict(result))
-
+            
         logging.info(f"Crawl of {self.start_url} led to {len(self.visited)} visits out of maximum {self.max_crawl_visits}.")
         logging.info(f"Crawl of {self.start_url} led to {len(self.results)} results out of {len(self.visited)} visits.")
 
