@@ -17,5 +17,4 @@ More info on statistical scraping [here](https://github.com/SNStatComp/SSIG)
     - `keywords`: the filename with the target keywords, see also `keywords_template.txt`
 
 # Known bugs and work in progress
-- wip: main.py just fetches a few example pages, not yet what the project intends to do
-- wip: crawling module is not fully tested, imports not sorted out, test code doesn't yield results
+- no support yet for js page content extraction
