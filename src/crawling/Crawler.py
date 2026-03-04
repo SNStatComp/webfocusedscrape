@@ -70,7 +70,7 @@ class Crawler(ICrawler):
 
     def is_allowed(self, url: str) -> bool:
         """Check if crawling the URL is allowed by robots.txt"""
-        return url == self.start_url or self.robots_parser.can_fetch("*", url)
+        return url == self.start_url or self.robots_parser.can_fetch("*", url)  # TODO: bug, not okay, robots deny can be ignored, we see weird non-utf content in these case
 
     def is_target(self, url: str) -> bool:
         """Check if the URL matches the target keywords in subdomain or path"""
