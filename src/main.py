@@ -72,7 +72,7 @@ def main():
                 hesitancy=2
             )
 
-        except urllib.error.URLError as e:
+        except Exception as e:
             logging.info(f"When initiating crawler, request failed with exception: {e}")
             logging.info("Crawling skipped, continuing with next base url")
             continue
