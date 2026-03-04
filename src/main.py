@@ -3,13 +3,17 @@ from omegaconf import OmegaConf
 from util import setup
 import logging
 from datetime import datetime
+import time
 import pandas as pd
+import numpy as np
+import urllib
 
 from fetch import Fetcher
 from crawling import HesitantCrawler
 from extract import MainContentExtractor
 
-logging.basicConfig(level=logging.INFO)
+
+CONFIG = setup("../config/config.yaml")
 
 
 def save_batch(batch, batch_id: int, dir_out: str):
@@ -32,20 +36,18 @@ def main():
     Crawl given urls to fetch relevant content from HTML
     """
 
-    config = setup("../config/config.yaml")
+    time_start = time.time()
 
-    print("Config:")
-    print(OmegaConf.to_yaml(config))
-
-    with open(f"{config.input.input_dir}/{config.input.input_files.urls}", 'r', encoding='utf-8') as file_in:
+    with open(f"{CONFIG.input.input_dir}/{CONFIG.input.input_files.urls}", 'r', encoding='utf-8') as file_in:
         urls = [line.rstrip() for line in file_in]
+    urls = urls[CONFIG.input.url_offset:CONFIG.input.url_offset+CONFIG.input.url_max]
 
     # TODO always store keywords as regex? or "regex-ify" keywords?
-    with open(f"{config.input.input_dir}/{config.input.input_files.keywords}", 'r', encoding='utf-8') as file_in:
+    with open(f"{CONFIG.input.input_dir}/{CONFIG.input.input_files.keywords}", 'r', encoding='utf-8') as file_in:
         keywords = [line.rstrip() for line in file_in]
 
     # create output folder with current datetime
-    dir_out = f"{config.output.output_dir}/{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+    dir_out = f"{CONFIG.output.output_dir}/{datetime.now().strftime('%Y%m%d_%H%M%S')}_offset{CONFIG.input.url_offset}"
     os.makedirs(dir_out, exist_ok=True)
     # TODO instead consider a given folder name and crash-robust resuming of batch iteration
 
@@ -54,7 +56,10 @@ def main():
     buffer = []
     batch_id = 0
 
-    for base_url in urls:
+    for cnt, base_url in enumerate(urls):
+
+        logging.info(f"Now at {cnt + 1} of {len(urls)} urls in this batch, started at {CONFIG.input.url_offset + 1}")
+        logging.info(f"Trying to crawl base url: {base_url}")
 
         try:
             # crawl url
@@ -75,13 +80,13 @@ def main():
         urlCrawler.crawl(base_url)
         crawledResults = urlCrawler.get_results()
 
-        fetcher = Fetcher()
+        fetcher = Fetcher(timeout=CONFIG.requests.timeout)
 
         for crawledResult in crawledResults:
             fetcher.fetch(url=crawledResult["url"])
         
         data = fetcher.get_results()
-        print("Data:", data.keys())
+        logging.info(f"Data: {data.keys()}")
 
         for url, html in data.items():
             buffer.append({
@@ -90,7 +95,7 @@ def main():
                 "content": extractor.extract(html=html["HTML"])
             })
 
-            if len(buffer) >= config.output.batchsize:
+            if len(buffer) >= CONFIG.output.batchsize:
                 save_batch(batch=buffer, batch_id=batch_id, dir_out=dir_out)
                 buffer = []
                 batch_id += 1
@@ -99,11 +104,30 @@ def main():
     if buffer:
         save_batch(batch=buffer, batch_id=batch_id, dir_out=dir_out)
 
+    time_duration = (time.time() - time_start) / 60
+    logging.info(f"Finished. Running main took {int(np.around(time_duration, 0))} minutes.")
+
 
 if __name__ == "__main__":
+
+    LOG_FILE = f"{CONFIG.output.output_dir}/{CONFIG.output.logs}"
+    if not os.path.exists(LOG_FILE):
+        os.makedirs(LOG_FILE)
+    LOG_FILE = f"{LOG_FILE}/{datetime.fromtimestamp(time.time()).strftime('%Y%m%d_%H%M%S')}_offset{CONFIG.input.url_offset}.log"
+    logFormatter = logging.Formatter("%(levelname)s %(asctime)s %(processName)s %(message)s")
+    fileHandler = logging.FileHandler("{0}".format(LOG_FILE))
+    fileHandler.setFormatter(logFormatter)
+    rootLogger = logging.getLogger()
+    rootLogger.addHandler(fileHandler)
+    rootLogger.setLevel(logging.INFO)
+
+    logging.info("Config:")
+    logging.info(OmegaConf.to_yaml(CONFIG))
+
     main()
 
     # # Read the output files by using the following syntax:
-    # config = setup("../config/config.yaml")
-    # df = pd.read_parquet(f"{config.output.output_dir}/20260224_143112", engine="pyarrow")
+    # CONFIG = setup("../config/config.yaml")
+    # df = pd.read_parquet(f"{CONFIG.output.output_dir}/20260304_080625", engine="pyarrow")
     # print(df.head())
+

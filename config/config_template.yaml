@@ -14,7 +14,10 @@ input:
   input_file:
     urls: urls.txt
     keywords: keywords.txt
+  url_max: 100
+  url_offset: 0
   input_variables:
 output:
   output_dir: ../output
   batchsize: 100
+  logs: logs

@@ -2,6 +2,8 @@ import requests
 from typing import Dict, Optional
 import time
 import random
+import urllib
+import logging
 
 
 class Fetcher:
@@ -47,12 +49,12 @@ class Fetcher:
 
             # Check for HTTP errors
             if response.status_code >= 400:
-                print(f"HTTP Error {response.status_code} for URL: {url}")
+                logging.info(f"HTTP Error {response.status_code} for URL: {url}")
                 return {}
 
             # Check if content is HTML
             if "text/html" not in response.headers.get("Content-Type", ""):
-                print(f"Non-HTML content received for URL: {url}")
+                logging.info(f"Non-HTML content received for URL: {url}")
                 return {}
 
             # Success
@@ -64,15 +66,19 @@ class Fetcher:
 
         except requests.exceptions.RequestException as e:
             # Handle exceptions
-            print(f"Request failed for {url}. Error: {e}")
+            logging.info(f"Request failed for {url}. Error: {e}")
 
             if retries < self.max_retries:
                 wait_time = random.uniform(1, 5)  # Random delay between 1 and 5 seconds
-                print(f"Retrying in {wait_time:.2f} seconds...")
+                logging.info(f"Retrying in {wait_time:.2f} seconds...")
                 time.sleep(wait_time)
                 return self._fetch_with_retries(url, retries + 1)
 
             # Max retries reached
+            return {}
+
+        except urllib.error.URLError as e:
+            logging.info(f"Request failed with exception: {e}")
             return {}
 
     def get_results(self) -> Dict[str, str]:
