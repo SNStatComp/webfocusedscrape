@@ -50,7 +50,7 @@ class Crawler(ICrawler):
         self.max_tries = max_tries
         self.add_sitemapurls = add_sitemapurls
 
-        self.domain = urlparse(start_url).netloc  # obtain domain from start_url
+        self.domain = urlparse(self.start_url).netloc  # obtain domain from start_url
         self.visited = set()
         self.results = set()
 
