@@ -16,6 +16,7 @@ from .Base import ICrawler
 class Crawler(ICrawler):
     def __init__(
             self,
+            user_agent: str,
             start_url: str,
             target_keywords: List[str] = None,
             max_crawl_visits: int = 100,
@@ -41,7 +42,7 @@ class Crawler(ICrawler):
         :param set_delay: use given delay regardless of robots.txt
         :param add_sitemapurls: True if urls from sitemap are added to crawl
         """
-        super(Crawler, self).__init__(start_url=start_url)
+        super(Crawler, self).__init__(user_agent=user_agent, start_url=start_url)
 
         self.target_keywords = [] if target_keywords is None else target_keywords
         # TODO: maybe have base list ready for given country in config
@@ -70,7 +71,7 @@ class Crawler(ICrawler):
 
     def is_allowed(self, url: str) -> bool:
         """Check if crawling the URL is allowed by robots.txt"""
-        return url == self.start_url or self.robots_parser.can_fetch("*", url)  # TODO: bug, not okay, robots deny can be ignored, we see weird non-utf content in these case
+        return self.robots_parser.can_fetch(useragent=self.user_agent, url=url)
 
     def is_target(self, url: str) -> bool:
         """Check if the URL matches the target keywords in subdomain or path"""
@@ -217,6 +218,7 @@ if __name__ == "__main__":
         ]
 
     crawler = Crawler(
+        user_agent="Web-FOSS-NL-webfocusedscrape/0.1 (https://github.com/SNStatComp/webfocusedscrape)",
         start_url="https://www.cbs.nl",
         target_keywords=keywords,
         max_crawl_visits=20,

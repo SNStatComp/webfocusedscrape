@@ -7,6 +7,7 @@ aws:
   session_token: 
   default_region: 
 requests:
+  useragent: Web-FOSS-NL-webfocusedscrape/0.1 (https://github.com/SNStatComp/webfocusedscrape)
   timeout: 5 # In seconds 
   default_language: English
 input:

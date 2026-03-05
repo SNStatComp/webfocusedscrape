@@ -14,6 +14,7 @@ from .Crawler import Crawler
 class HesitantCrawler(Crawler):
     def __init__(
             self,
+            user_agent: str,
             start_url: str,
             target_keywords: List[str] = None,
             max_crawl_visits: int = 100,
@@ -42,6 +43,7 @@ class HesitantCrawler(Crawler):
         :param add_sitemapurls: True if urls from sitemap are added to crawl
         """
         super(HesitantCrawler, self).__init__(
+            user_agent=user_agent,
             start_url=start_url,
             target_keywords=target_keywords,
             max_crawl_visits=max_crawl_visits,
@@ -113,6 +115,7 @@ if __name__ == "__main__":
         ]
 
     crawler = HesitantCrawler(
+        user_agent="Web-FOSS-NL-webfocusedscrape/0.1 (https://github.com/SNStatComp/webfocusedscrape)",
         start_url="https://www.duo.nl",
         target_keywords=keywords,
         max_crawl_visits=100,

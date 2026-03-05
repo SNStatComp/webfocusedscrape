@@ -6,10 +6,11 @@ class ICrawler(ABC):
     """
     Discover pages that might match target category
     """
-    def __init__(self, start_url: str):
+    def __init__(self, user_agent: str, start_url: str):
         if not start_url.startswith('https://') and not start_url.startswith('http://'):
             start_url = f"https://{start_url}"
         self.start_url = start_url
+        self.user_agent = user_agent
 
     @abstractmethod
     def is_allowed(self, url: str) -> bool:

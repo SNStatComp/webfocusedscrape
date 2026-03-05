@@ -64,6 +64,7 @@ def main():
         try:
             # crawl url
             urlCrawler = HesitantCrawler(
+                user_agent=CONFIG.requests.useragent,
                 start_url=base_url,
                 target_keywords=keywords,
                 max_crawl_visits=100,
