@@ -6,7 +6,6 @@ from datetime import datetime
 import time
 import pandas as pd
 import numpy as np
-import urllib
 
 from fetch import Fetcher
 from crawling import HesitantCrawler
@@ -40,7 +39,7 @@ def main():
 
     with open(f"{CONFIG.input.input_dir}/{CONFIG.input.input_files.urls}", 'r', encoding='utf-8') as file_in:
         urls = [line.rstrip() for line in file_in]
-    urls = urls[CONFIG.input.url_offset:CONFIG.input.url_offset+CONFIG.input.url_max]
+    urls = urls[CONFIG.input.url_offset:CONFIG.input.url_offset + CONFIG.input.url_max]
 
     # TODO always store keywords as regex? or "regex-ify" keywords?
     with open(f"{CONFIG.input.input_dir}/{CONFIG.input.input_files.keywords}", 'r', encoding='utf-8') as file_in:

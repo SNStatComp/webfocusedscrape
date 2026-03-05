@@ -208,14 +208,14 @@ if __name__ == "__main__":
     logging.basicConfig(level=logging.DEBUG)
 
     keywords = [
-            "werk(en)?-?bij",
-            "vacature(s)?",
-            "job(s)?",
-            "career(s)?"
-            "cari(e|è)re"
-            "collega"
-            "versterk"
-        ]
+        "werk(en)?-?bij",
+        "vacature(s)?",
+        "job(s)?",
+        "career(s)?"
+        "cari(e|è)re"
+        "collega"
+        "versterk"
+    ]
 
     crawler = Crawler(
         user_agent="Web-FOSS-NL-webfocusedscrape/0.1 (https://github.com/SNStatComp/webfocusedscrape)",

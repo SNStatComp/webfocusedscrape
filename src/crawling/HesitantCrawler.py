@@ -1,12 +1,5 @@
-import requests
-from urllib.parse import urljoin, urlparse
-from bs4 import BeautifulSoup
-from urllib.robotparser import RobotFileParser
-from usp.tree import sitemap_tree_for_homepage
 from typing import List
-import time
 import logging
-import re
 
 from .Crawler import Crawler
 
@@ -23,7 +16,7 @@ class HesitantCrawler(Crawler):
             set_delay: int = None,
             add_sitemapurls: bool = True,
             hesitancy: int = 1  # Hesitancy reflects the idea to crawl on non-relevant pages because they might lead to relevant pages
-        ):
+    ):
         """
         Crawler class for obtaining urls from start_url.
         Crawler will look for urls on start_url and append them to list. It will then
@@ -72,10 +65,8 @@ class HesitantCrawler(Crawler):
         # If we have exceeded max tries since result, also skip
         if (
             (
-                self.estimateSiteDepth(current_url) >= self.hesitancy
-                or tries_since_result > self.max_tries
-            ) and not self.is_target(current_url)
-            and (targeted or tries_since_result > self.max_tries)
+                self.estimateSiteDepth(current_url) >= self.hesitancy or tries_since_result > self.max_tries
+            ) and not self.is_target(current_url) and (targeted or tries_since_result > self.max_tries)
             
         ):
             return True
@@ -104,15 +95,15 @@ if __name__ == "__main__":
     logging.basicConfig(level=logging.DEBUG)
 
     keywords = [
-            "werk(en)?-?bij",
-            "vacature(s)?",
-            "job(s)?",
-            "career(s)?"
-            "cari(e|è)re"
-            "collega"
-            "versterk"
-            "sollic(iteer|itatie)"
-        ]
+        "werk(en)?-?bij",
+        "vacature(s)?",
+        "job(s)?",
+        "career(s)?"
+        "cari(e|è)re"
+        "collega"
+        "versterk"
+        "sollic(iteer|itatie)"
+    ]
 
     crawler = HesitantCrawler(
         user_agent="Web-FOSS-NL-webfocusedscrape/0.1 (https://github.com/SNStatComp/webfocusedscrape)",
