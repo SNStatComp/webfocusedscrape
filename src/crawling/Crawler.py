@@ -168,10 +168,13 @@ class Crawler(ICrawler):
     def crawl(self, targeted=True):
         """Main crawling function"""
         queue = [self.start_url]
+        start_time = time.time()  # TODO: add max crawl duration to config
+        duration = 0
 
         logging.info(f"Starting crawl of {self.start_url}..")
         tries_since_result = 0
-        while queue and len(self.visited) <= self.max_crawl_visits:
+        while queue and len(self.visited) <= self.max_crawl_visits and duration < 300:
+            duration = time.time() - start_time
             current_url = queue.pop(0)
             if len(queue) > 0:
                 random.shuffle(queue)
@@ -188,6 +191,8 @@ class Crawler(ICrawler):
             
         logging.info(f"Crawl of {self.start_url} led to {len(self.visited)} visits out of maximum {self.max_crawl_visits}.")
         logging.info(f"Crawl of {self.start_url} led to {len(self.results)} results out of {len(self.visited)} visits.")
+        duration = time.time() - start_time
+        logging.info(f"Crawl took {duration} seconds.")
 
         # Optionally extract sitemap URLs
         if self.add_sitemapurls:
