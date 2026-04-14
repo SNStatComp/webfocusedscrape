@@ -1,16 +1,21 @@
-import requests
-from urllib.parse import urljoin, urlparse
-from bs4 import BeautifulSoup
-from urllib.robotparser import RobotFileParser
-from usp.tree import sitemap_tree_for_homepage
 from typing import List
 import time
 import logging
 import re
-import random
 from frozendict import frozendict
 
+import numpy as np
+from urllib.robotparser import RobotFileParser
+from urllib.parse import urljoin, urlparse
+import requests
+from usp.tree import sitemap_tree_for_homepage
+from bs4 import BeautifulSoup
+
 from .Base import ICrawler
+from util import setup
+
+
+CONFIG = setup("../config/config.yaml")
 
 
 class Crawler(ICrawler):
@@ -19,102 +24,137 @@ class Crawler(ICrawler):
             user_agent: str,
             start_url: str,
             target_keywords: List[str] = None,
-            max_crawl_visits: int = 100,
-            max_tries: int = 100,
-            use_robots_delay: bool = True,
-            set_delay: int = None,
-            add_sitemapurls: bool = True):
+            add_sitemapurls: bool = False):
         """
+        Basic Crawler class
         Crawler class for obtaining urls from start_url.
         Crawler will look for urls on start_url and append them to list. It will then
             look for urls in the next item on the list and append urls to the end of the list. 
         Once the max_crawl_visit is visited, crawl stops.
 
         Can be used for a focused crawl if target_keywords are given.
-        If sitemap is also to be checked for urls, set add_sitemapurls = True
-        If sitemaps should be used exclusively, set max_crawl_visits = 0 or 
-            use get_sitemap_urls() directly
+        In that case only URLs found that meet the target keywords are stored in the results.
 
+        If sitemap is also to be checked for urls, set add_sitemapurls = True
+        If sitemaps should be used exclusively, set max_crawl_visits = 0 in config file
+
+        :param user_age: your robot name
         :param start_url: the URL from which to start the crawl
         :param target_keywords: list of keywords required to be in the url for focused scrape, defaults to no keywords
-        :param max_crawl_visits: maximum number of pages to visit during crawl
-        :param use_robots_delay: set delay according to robots.txt, if available
-        :param set_delay: use given delay regardless of robots.txt
-        :param add_sitemapurls: True if urls from sitemap are added to crawl
+        :param add_sitemapurls: True if urls from sitemap are added to crawl, defaults to False
         """
-        super(Crawler, self).__init__(user_agent=user_agent, start_url=start_url)
-
-        self.target_keywords = [] if target_keywords is None else target_keywords
-        # TODO: maybe have base list ready for given country in config
-
-        self.max_crawl_visits = max_crawl_visits
-        self.max_tries = max_tries
-        self.add_sitemapurls = add_sitemapurls
+        super(Crawler, self).__init__(
+            user_agent=user_agent,
+            start_url=start_url)
 
         self.domain = urlparse(self.start_url).netloc  # obtain domain from start_url
+        logging.debug(f"The domain is identified as {self.domain}")
+
         self.visited = set()
         self.results = set()
+        self._queue = []
+        self._istargeted = dict()  # will keep track of urls and if they met targeting conditions
 
         # use a Parser for robots.txt
         self.robots_parser = RobotFileParser()
         self.robots_parser.set_url(f"https://{self.domain}/robots.txt")
         self.robots_parser.read()
+        logging.debug("Robot file has been read.")
 
-        # set delay, defaults to 2
-        self.delay = 2
-        if set_delay is not None:
-            self.delay = set_delay
-        elif use_robots_delay:  # only if set_delay is None
-            delay_robot = self.robots_parser.crawl_delay("*")
-            if delay_robot is not None:
-                self.delay = delay_robot
+        # respect crawl delay if present
+        self.crawl_delay = self.robots_parser.crawl_delay(useragent=self.user_agent) or 2
+        logging.debug(f"Crawl delay is set to {self.crawl_delay}")
+
+        self.max_duration = CONFIG.crawl.max_duration
+        logging.debug(f"Max duration of crawl set to {self.max_duration} seconds")
+
+        self.max_crawl_visits = CONFIG.crawl.max_visits
+        logging.debug(f"Max page visits of crawl set to {self.max_crawl_visits}")
+
+        self._unsupported = ('.jpg', '.png', '.pdf', '/feed/', '/image/')
+        logging.debug(f"URLs will be excluded if they contain any in path:{', '.join(self._unsupported)}")
+
+        logging.info(f"Check URLs from sitemap: {add_sitemapurls}")
+        self._sitemapurls = []
+        if add_sitemapurls:
+            try:
+                tree = sitemap_tree_for_homepage(self.start_url)
+                self._sitemapurls = [page.url for page in tree.all_pages()]
+            except Exception as e:
+                logging.warning(f"Could not fetch sitemap: {e}")
+
+        if target_keywords is None:
+            self.target_keywords = []
+            self.targeted_search = False
+            logging.warning("No target_keywords were given, therefore the crawl will be untargeted")
+        else:
+            self.target_keywords = target_keywords
+            self.targeted_search = True
+            logging.info(f"The targeted crawl will look for given keywords: {', '.join(self.target_keywords)}")
 
     def is_allowed(self, url: str) -> bool:
         """Check if crawling the URL is allowed by robots.txt"""
         return self.robots_parser.can_fetch(useragent=self.user_agent, url=url)
 
-    def is_target(self, url: str) -> bool:
-        """Check if the URL matches the target keywords in subdomain or path"""
-        # Always permit start url
-        if url == self.start_url:
-            return True
-        if len(self.target_keywords) == 0:
-            return True  # No filtering if no keywords
+    def skip_this_url(self, url: str) -> bool:
+        """Function to see if we can/ must skip this URL instead of visiting it"""
 
+        # Do not revisit pages
+        if url in self.visited:
+            logging.debug(f"Skip {url}, because we have visited it before")
+            return True  # skip
+
+        # URL must be allowed (or start url)
+        if not self.is_allowed(url):
+            logging.debug(f"Skip {url}, because it is not allowed")
+            return True  # skip
+
+        logging.debug(f"No need to skip {url}.")
+        return False 
+
+    def find_target(self, url: str) -> str:
+        """Check if the URL matches the target keywords in subdomain or path"""
+        
         parsed = urlparse(url)
         subdomain = parsed.netloc
+        logging.debug(f"Current URL subdomain is identified as: {subdomain}")
         path = parsed.path
+        logging.debug(f"Current URL path is identified as: {path}")
 
         # Check for keywords in subdomain
         for keyword in self.target_keywords:
-            if re.search(keyword, subdomain) is not None:
-                return True
+            first_keyword_hit = re.search(keyword, subdomain)
+            if first_keyword_hit is not None:
+                logging.debug(f"Target is met in the subdomain: {subdomain}")
+                logging.debug(f"Target is met with the following hit: {first_keyword_hit.group(0)}")
+                return first_keyword_hit.group(0)
 
         # Check for keywords in path
         for keyword in self.target_keywords:
-            if re.search(keyword, path) is not None:
-                return True
+            first_keyword_hit = re.search(keyword, path)
+            if first_keyword_hit is not None:
+                logging.debug(f"Target is met in the path: {path}")
+                logging.debug(f"Target is met with the following hit: {first_keyword_hit.group(0)}")
+                return first_keyword_hit.group(0)
 
-        return False
-
-    def get_sitemap_urls(self) -> List[str]:
-        """Get URLs from the sitemap if available"""
-        try:
-            tree = sitemap_tree_for_homepage(self.start_url)
-            return [page.url for page in tree.all_pages()]
-        except Exception as e:
-            logging.warning(f"Could not fetch sitemap: {e}")
-            return []
-
-    def visitUrl(self, queue, url):
-        logging.debug(f"Visiting: {url}")
+        logging.debug("Target has not been met, no hit")
+        return ''
+        
+    def visit_url(self, url) -> str:
+        """
+        Generator that visits the site and yields a URLs to check for target condition        
+        """
+        logging.debug(f"Visiting {url} to find linked URLs")
         self.visited.add(url)
 
         try:
-            response = requests.get(url, timeout=10)
+            response = requests.get(
+                url, timeout=(
+                    CONFIG.requests.timeout_connect, 
+                    CONFIG.requests.timeout_read))  # connect timeout and read timeout
             if response.status_code != 200:
-                logging.debug(f"Exited with response status: {response.status_code}")
-                return
+                logging.warning(f"Exited with response status: {response.status_code}")
+                yield None
 
             soup = BeautifulSoup(response.text, "html.parser")
 
@@ -125,110 +165,120 @@ class Crawler(ICrawler):
                 parsed = urlparse(absolute_url)
 
                 if parsed.netloc == self.domain and absolute_url not in self.visited:
-                    queue.append(absolute_url)                        
-
-            # Respect crawl delay
-            time.sleep(self.delay)
+                    logging.debug(f"Found a URL to check: {absolute_url}")
+                    yield absolute_url      
 
         except Exception as e:
             logging.error(f"Error crawling {url}: {e}")
-    
-    # Function to see if we can skip this URL during crawl
-    def checkURLSkipCriteria(self, current_url, targeted, tries_since_result):
-        # Do not revisit pages
-        if current_url in self.visited:
-            return True
 
-        # URL is allowed (or start url)
-        if not self.is_allowed(current_url):
-            logging.debug(f"{current_url} is not allowed")
-            return True
-        
-        # URL is target (or start url) when crawl is targeted
-        if not self.is_target(current_url) and (targeted or tries_since_result > self.max_tries):
-            logging.debug(f"{current_url} is not allowed")
-            return True
-
-        return False
-    
-    # Function to process result and if compliant, add it to the results list
-    def processResult(self, current_url, targeted):
-        # In Crawler we only do not add result if result is not target while crawling targeted
-        if targeted and not self.is_target(current_url):
-            return None
+    def add_to_results(self, url: str, first_keyword_hit: str):
+        """Function to process result and if compliant, add it to the results list"""
 
         # We use a dict for result to potentially add more metadata
         result = {
-            "url": current_url,
+            "url": url,
             "source": "crawl",
-            "targeted": targeted
+            "targeted": self.targeted_search,
+            "first_keyword_hit": first_keyword_hit
         }
-        return result
-
-    def crawl(self, targeted=True):
-        """Main crawling function"""
-        queue = [self.start_url]
-        start_time = time.time()  # TODO: add max crawl duration to config
-        duration = 0
-
-        logging.info(f"Starting crawl of {self.start_url}..")
-        tries_since_result = 0
-        while queue and len(self.visited) <= self.max_crawl_visits and duration < 300:
-            duration = time.time() - start_time
-            current_url = queue.pop(0)
-            if len(queue) > 0:
-                random.shuffle(queue)
-
-            tries_since_result += 1
-            if self.checkURLSkipCriteria(current_url, targeted, tries_since_result):
-                continue
-
-            self.visitUrl(queue, current_url)
-            result = self.processResult(current_url, targeted)
-            if result is not None:
-                tries_since_result = 0
-                self.results.add(frozendict(result))
-            
-        logging.info(f"Crawl of {self.start_url} led to {len(self.visited)} visits out of maximum {self.max_crawl_visits}.")
-        logging.info(f"Crawl of {self.start_url} led to {len(self.results)} results out of {len(self.visited)} visits.")
-        duration = time.time() - start_time
-        logging.info(f"Crawl took {duration} seconds.")
-
-        # Optionally extract sitemap URLs
-        if self.add_sitemapurls:
-            sitemap_urls = self.get_sitemap_urls()
-            for url in sitemap_urls:
-                if url not in self.visited and self.is_allowed(url) and self.is_target(url):
-                    self.visited.add(url)
-                    self.results.add(url)
-                    logging.debug(f"Adding from sitemap: {url}")
-            logging.info(f"Sitemap raised number of results to {len(self.results)}.")
+        self.results.add(frozendict(result))
 
     def get_results(self) -> List[str]:
         """Return the set of URLs that matched the target criteria"""
         return self.results
+            
+    def process_url(self, url: str):
+        """check url for target and then add to results and queue"""
+
+        if url in self._istargeted:
+            logging.debug(f"Already checked, and so not again checking url: {url}")
+            return
+        logging.debug(f"Checking the target requirement for found url: {url}")
+
+        if any(ext in url for ext in self._unsupported):
+            self._istargeted[url] = False
+            logging.debug("Unsupported url")
+            return
+
+        # URL is either targeted by default or else it must meet the target requirements
+        if not self.targeted_search:
+            self._istargeted[url] = True
+            first_keyword_hit = ''
+            logging.debug("Since we do an untargeted crawl, the URL is targeted by default")  
+        else:
+            first_keyword_hit = self.find_target(url=url)
+            self._istargeted[url] = True if len(first_keyword_hit) > 0 else False
+            logging.debug(f"Result of check if the URL is targeted: {self._istargeted[url]}")
+        
+        # Add to results, and queue, if targeted
+        # Also add it to the queue of URLs to visit for more URLS
+        if self._istargeted[url]:
+            logging.info(f"Found a targeted URL: {url}")
+            logging.debug("Adding the URL to our list with results and also the queue for visiting")
+            self.add_to_results(url=url, first_keyword_hit=first_keyword_hit)
+            self._queue.append(url)
+    
+    def crawl(self):
+        """
+        Main crawling function
+        Results can be otbained by calling get_results()
+        """
+
+        # The queue will be updated with found urls and then worked through
+        # until a maximum number of visits or duration is reached
+        self._queue = [self.start_url]
+        start_time = time.time()
+        duration = 0
+
+        logging.info(f"Starting crawl of {self.start_url}..")
+
+        # If we want and have sitemaps URLs, start here
+        for sitemapurl in self._sitemapurls:
+            self.process_url(url=sitemapurl)
+
+        while self._queue and len(self.visited) < self.max_crawl_visits and duration < self.max_duration:
+
+            # Take an element from the queue
+            visiting_url = self._queue.pop(0)  # will start with base url, then whatever will have been added next
+            
+            # Check the criteria for skipping the current url
+            logging.debug(f"Check if {visiting_url} can or must be skipped")
+            if self.skip_this_url(url=visiting_url):
+                continue
+
+            # let's visit the page and find URL's to check for meeting the target, those
+            #   will also end up in results and queue
+            for found_url in self.visit_url(url=visiting_url):
+                self.process_url(url=found_url)
+            
+            # At the end, measure how long we've been busy so far
+            duration = time.time() - start_time
+
+            # Respect crawl delay
+            logging.debug("Waiting for delay to pass")
+            time.sleep(self.crawl_delay)
+            logging.debug("Delay has passed")
+        
+        # Crawl stopped
+        logging.debug(f"Crawl stopped after {np.around(duration, 0)} seconds, with max duration {self.max_duration} seconds")
+        logging.debug(f"Crawl stopped after {len(self.visited)} page visits, with max {self.max_crawl_visits}")
+        logging.debug(f"Crawl stopped with {len(self._queue)} urls still in the queue")
+
+        logging.info(f"Crawling {self.domain} resulted in {len(self.get_results())} results")
+        logging.debug(f"Crawling {self.domain} results: {self.get_results()}")
+        logging.info(f"In total {len(self._istargeted)} URLs have been checked for meeting the target")
 
 
 if __name__ == "__main__":
-    logging.basicConfig(level=logging.DEBUG)
+    logging.basicConfig(level=logging.INFO)
 
-    keywords = [
-        "werk(en)?-?bij",
-        "vacature(s)?",
-        "job(s)?",
-        "career(s)?"
-        "cari(e|è)re"
-        "collega"
-        "versterk"
-    ]
+    keywords = ["science", "music"]
 
     crawler = Crawler(
         user_agent="Web-FOSS-NL-webfocusedscrape/0.1 (https://github.com/SNStatComp/webfocusedscrape)",
-        start_url="https://www.cbs.nl",
+        start_url="https://books.toscrape.com",
         target_keywords=keywords,
-        max_crawl_visits=20,
         add_sitemapurls=False
     )
-    crawler.crawl(targeted=True)
-    print("#Found URLs:", len(crawler.get_results()))
-    print("Found URLs:", crawler.get_results())
+
+    crawler.crawl()

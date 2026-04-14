@@ -66,9 +66,6 @@ def main():
                 user_agent=CONFIG.requests.useragent,
                 start_url=base_url,
                 target_keywords=keywords,
-                max_crawl_visits=100,
-                max_tries=100,  # TODO: in de CONFIG
-                add_sitemapurls=False,
                 hesitancy=2
             )
 
@@ -77,10 +74,12 @@ def main():
             logging.info("Crawling skipped, continuing with next base url")
             continue
 
-        urlCrawler.crawl(base_url)
+        urlCrawler.crawl()
         crawledResults = urlCrawler.get_results()
 
-        fetcher = Fetcher(timeout=CONFIG.requests.timeout)
+        fetcher = Fetcher(
+            user_agent=CONFIG.requests.useragent, 
+            timeout=10)  # TODO: change to config
 
         for crawledResult in crawledResults:
             fetcher.fetch(url=crawledResult["url"])

@@ -8,11 +8,12 @@ aws:
   default_region: 
 requests:
   useragent: Web-FOSS-NL-webfocusedscrape/0.1 (https://github.com/SNStatComp/webfocusedscrape)
-  timeout: 5 # In seconds 
+  timeout_connect: 3 # In seconds 
+  timeout_read: 7 # In seconds 
   default_language: English
 input:
   input_dir: ../input
-  input_file:
+  input_files:
     urls: urls.txt
     keywords: keywords.txt
   url_max: 100
@@ -22,3 +23,6 @@ output:
   output_dir: ../output
   batchsize: 100
   logs: logs
+crawl:
+  max_duration: 500
+  max_visits: 200
