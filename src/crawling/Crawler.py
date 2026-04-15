@@ -99,6 +99,9 @@ class Crawler(ICrawler):
     def skip_this_url(self, url: str) -> bool:
         """Function to see if we can/ must skip this URL instead of visiting it"""
 
+        # prevent duplicate crawl from trailing forward slash in URL
+        url = url.rstrip('/') if url.endswith('/') else url
+
         # Do not revisit pages
         if url in self.visited:
             logging.debug(f"Skip {url}, because we have visited it before")
