@@ -12,6 +12,17 @@ class IExtractor(ABC):
         raise NotImplementedError("Do not call abstract base class.")
 
 
+class EmptystringExtractor(IExtractor):
+    """
+    Testing Extractor that just returns an empty string
+    """
+    def __init__(self):
+        pass
+
+    def extract(self, html: str) -> str:
+        return ''
+
+
 class MainContentExtractor(IExtractor):
     """
     Extract the main human-readable text from a web page
