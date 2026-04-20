@@ -10,7 +10,7 @@ requests:
   useragent: Web-FOSS-NL-webfocusedscrape/0.1 (https://github.com/SNStatComp/webfocusedscrape)
   timeout_connect: 3 # In seconds 
   timeout_read: 7 # In seconds 
-  default_language: English
+  max_retries: 3
 input:
   input_dir: ../input
   input_files:
