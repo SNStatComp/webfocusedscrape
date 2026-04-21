@@ -13,7 +13,7 @@ from .base import IFetcher
 CONFIG = setup("../config/config.yaml")
 
 
-class Fetcher(IFetcher):
+class HTMLFetcher(IFetcher):
     """
     Standard Fetcher
     Fetches the HTML content of the given URL with retries and error handling.
@@ -21,16 +21,17 @@ class Fetcher(IFetcher):
     Returns a dictionary with the URL as key and the HTML content as value.
     """
     def __init__(
-        self,
-        user_agent: str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-        headers: Optional[Dict] = None
-            ):
+            self,
+            user_agent: str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+            headers: Optional[Dict] = None):
+        logging.info("Initializing HTMLFetcher")
+        super(HTMLFetcher, self).__init__(user_agent=user_agent)
         self.user_agent = user_agent
         logging.debug(f"User agent given as: {user_agent}")
 
         self.timeout = (
-                    CONFIG.requests.timeout_connect,
-                    CONFIG.requests.timeout_read)
+            CONFIG.requests.timeout_connect,
+            CONFIG.requests.timeout_read)
         logging.debug(f"Timeout for connection is {CONFIG.requests.timeout_connect} seconds, for reading {CONFIG.requests.timeout_read} seconds")
 
         self.max_retries = CONFIG.requests.max_retries
@@ -45,8 +46,6 @@ class Fetcher(IFetcher):
         }
         headers_str = ', '.join([f"{k}: {v}" for k, v in self.headers.items()])
         logging.debug(f"Request headers set to {headers_str}")
-
-        self.results = {}  # {url: html_content}
 
         # Domain will have to be identified for any given url to fetch, then the corresponding robots file will be checked
         # keep track of domains that have already been checked
@@ -80,7 +79,7 @@ class Fetcher(IFetcher):
 
         return self._fetch_with_retries(url)
 
-    def _fetch_with_retries(self, url: str, retries: int = 0) -> Dict[str, str]:
+    def _fetch_with_retries(self, url: str, retries: int = 0):
         """
         Internal method that performs the request with retry logic.
         """
@@ -98,9 +97,8 @@ class Fetcher(IFetcher):
                 return {}
 
             # Success
-            result = {"HTML": response.text}
+            result = response.text
             self.results[url] = result
-            return self.results
 
         except requests.exceptions.RequestException as e:
             # Handle exceptions
@@ -130,7 +128,7 @@ if __name__ == "__main__":
 
     logging.basicConfig(level=logging.DEBUG)
 
-    fetcher = Fetcher(
+    fetcher = HTMLFetcher(
         user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
     )
 
@@ -146,4 +144,4 @@ if __name__ == "__main__":
 
     for url, html in fetcher.get_results().items():
         print(f"\nURL: {url}")
-        print(f"...{html['HTML'][:100]}...\n\n")
+        print(f"...{html[:100]}...\n\n")

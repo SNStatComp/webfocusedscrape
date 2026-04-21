@@ -92,7 +92,7 @@ def main():
                 buffer.append({
                     "base_url": base_url,
                     "url": url,
-                    "content": extractor.extract(html=html["HTML"])
+                    "content": extractor.extract(html=html)
                 })
             except ValueError as e:
                 logging.info(f"Applying extractor for url {url} failed with exception: {e}")
