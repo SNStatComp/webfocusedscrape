@@ -55,12 +55,8 @@ class HTMLFetcher(IFetcher):
         self.results = {}
         return
 
-    def fetch(self, url: str) -> Dict[str, str]:
-        """
-        Fetches the HTML content of the given URL with retries and error handling.
-        Returns a dictionary with the URL as key and the HTML content as value.
-        """
-        logging.info(f"Trying to fetch the next URL: {url}")
+    def is_allowed(self, url: str) -> bool:
+        """Will check if robots of given domain allows fetching"""
 
         # Identify given domain to check corresponding robots file
         domain = urlparse(url).netloc  # obtain domain from url
@@ -72,8 +68,21 @@ class HTMLFetcher(IFetcher):
             logging.debug(f"A new robots file has been read for domain {domain}")
         
         # check if allowed
+        if self._robots_bydomain[domain].can_fetch(useragent=self.user_agent, url=url):
+            return True
+        else:
+            return False
+
+    def fetch(self, url: str) -> str:
+        """
+        Fetches the HTML content of the given URL with retries and error handling.
+        Returns a dictionary with the URL as key and the HTML content as value.
+        """
+        logging.info(f"Trying to fetch the next URL: {url}")
+
+        # check if allowed
         logging.info("Checking if url is allowed")
-        if not self._robots_bydomain[domain].can_fetch(useragent=self.user_agent, url=url):
+        if not self.is_allowed(url=url):
             logging.info(f"Given url skipped because it is not allowed: {url}")
             return {}
 
@@ -99,6 +108,7 @@ class HTMLFetcher(IFetcher):
             # Success
             result = response.text
             self.results[url] = result
+            return result
 
         except requests.exceptions.RequestException as e:
             # Handle exceptions

@@ -14,7 +14,7 @@ class IFetcher(ABC):
         self.results = {}  # {url: html_content}
 
     @abstractmethod
-    def fetch(self, url: str):
+    def fetch(self, url: str) -> str:
         """Fetches content for given url"""
         raise NotImplementedError()
 
@@ -38,9 +38,10 @@ class NoFetcher(IFetcher):
 <body>Hello</body>
 </html>""")
 
-    def fetch(self, url: str):
+    def fetch(self, url: str) -> str:
         """Fetches default minimal html"""
         self.results[url] = self._default_html
+        return self.results[url]
 
     def get_results(self) -> Dict[str, str]:
         """
