@@ -1,3 +1,4 @@
+import logging
 from abc import ABC, abstractmethod
 from bs4 import BeautifulSoup
 
@@ -17,6 +18,7 @@ class EmptystringExtractor(IExtractor):
     Testing Extractor that just returns an empty string
     """
     def __init__(self):
+        logging.info("This testing extractor just returns an empty string for any given html")
         pass
 
     def extract(self, html: str) -> str:
@@ -30,23 +32,27 @@ class MainContentExtractor(IExtractor):
     Accepts raw HTML as input.
     """
     def __init__(self):
-        pass
+        logging.info("Initializing extractor that will look for main content in html using BeautifulSoup")
+        self._disregard = ["script", "style", "nav", "footer", "header", "aside"]
+        logging.debug(f"Extractor disregards tags: {', '.join(self._disregard)}")
 
     def extract(self, html: str) -> str:
         soup = BeautifulSoup(html, "html.parser")
 
         # Remove non-content, basic start
-        for tag in soup(["script", "style", "nav", "footer", "header", "aside"]):
+        for tag in soup(self._disregard):
             tag.decompose()
         text = soup.get_text(separator="\n", strip=True)
+        logging.debug(f"First 100 characters of text extracted: {text[0:100]}")
         return text
 
 
 if __name__ == "__main__":
     import requests
 
-    # This is a cut-off example of the HTML input (cut-off so that this code is not too long)
-    url = "https://www.abp.nl/over-abp/over-de-organisatie/werken-bij/vacature-senior-adviseur-pensioenen"
+    logging.basicConfig(level=logging.DEBUG)
+    
+    url = "https://books.toscrape.com/catalogue/william-shakespeares-star-wars-verily-a-new-hope-william-shakespeares-star-wars-4_871/index.html"
     html_data = requests.get(url).text
 
     extractor = MainContentExtractor()
