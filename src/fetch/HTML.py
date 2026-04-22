@@ -3,7 +3,6 @@ from typing import Dict, Optional
 import time
 import random
 import urllib
-from urllib.robotparser import RobotFileParser
 from urllib.parse import urlparse
 import logging
 
@@ -17,7 +16,7 @@ class HTMLFetcher(IFetcher):
     """
     Standard Fetcher
     Fetches the HTML content of the given URL with retries and error handling.
-    Uses a robots parser
+    Uses a robots fetcher
     Returns a dictionary with the URL as key and the HTML content as value.
     """
     def __init__(
@@ -48,8 +47,10 @@ class HTMLFetcher(IFetcher):
         logging.debug(f"Request headers set to {headers_str}")
 
         # Domain will have to be identified for any given url to fetch, then the corresponding robots file will be checked
-        # keep track of domains that have already been checked
-        self._robots_bydomain = dict()
+        # this is handled by RobotsFetcher
+        from .Robots import RobotsFetcher
+        self.robotsfetcher = RobotsFetcher(user_agent=user_agent)
+        self._robots_bydomain = self.robotsfetcher.get_results()
 
     def resetResults(self):
         self.results = {}
@@ -63,7 +64,7 @@ class HTMLFetcher(IFetcher):
         logging.debug(f"The domain is identified as {domain}")
 
         if not self._robots_bydomain.get(domain, False):
-            self._robots_bydomain[domain] = RobotFileParser(url=f"https://{domain}/robots.txt")
+            self.robotsfetcher.fetch(domain=domain)
             self._robots_bydomain[domain].read()
             logging.debug(f"A new robots file has been read for domain {domain}")
         
@@ -81,9 +82,9 @@ class HTMLFetcher(IFetcher):
         logging.info(f"Trying to fetch the next URL: {url}")
 
         # check if allowed
-        logging.info("Checking if url is allowed")
+        logging.debug("Checking if url is allowed")
         if not self.is_allowed(url=url):
-            logging.info(f"Given url skipped because it is not allowed: {url}")
+            logging.debug(f"Given url skipped because it is not allowed: {url}")
             return {}
 
         return self._fetch_with_retries(url)
@@ -138,8 +139,9 @@ if __name__ == "__main__":
 
     logging.basicConfig(level=logging.DEBUG)
 
+    user_agent = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
     fetcher = HTMLFetcher(
-        user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+        user_agent=user_agent
     )
 
     urls = [

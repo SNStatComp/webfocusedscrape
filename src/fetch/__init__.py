@@ -1,2 +1,3 @@
 from fetch.base import IFetcher, NoFetcher
-from fetch.Fetcher import HTMLFetcher
+from fetch.Robots import RobotsFetcher
+from fetch.HTML import HTMLFetcher

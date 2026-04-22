@@ -14,12 +14,12 @@ class IFetcher(ABC):
         self.results = {}  # {url: html_content}
 
     @abstractmethod
-    def fetch(self, url: str) -> str:
+    def fetch(self, url: str):
         """Fetches content for given url"""
         raise NotImplementedError()
 
     @abstractmethod
-    def get_results(self) -> Dict[str, str]:
+    def get_results(self) -> Dict:
         """Returns the dictionary of fetched URLs and their content"""
         return NotImplementedError()
 
