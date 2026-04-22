@@ -88,6 +88,9 @@ class Scraper(IScraper):
             self._crawler.reset_with_starturl(start_url=base_url)
             self._crawler.crawl()
 
+            # track content by base_url to prevent duplicates
+            seen_content = set()
+
             delay = self._crawler.crawl_delay  # might be different depending on curren domain
 
             # After crawl, collect results and parse content of targeted sites
@@ -106,6 +109,11 @@ class Scraper(IScraper):
                 
                 content = self._htmlparser.parse(html=html)
                 if len(content) > 0:
+                    if content in seen_content:  # No dupliactes
+                        logging.debug(f"Content from {crawlresult.url} is a duplicate, not added to output")
+                        continue
+
+                    seen_content.add(content)
                     buffer.append({
                         "base_url": base_url,
                         "url": crawlresult.url,
@@ -117,14 +125,14 @@ class Scraper(IScraper):
 
                 if len(buffer) >= CONFIG.output.batchsize:
                     self.save_batch(batch=buffer, batch_id=batch_id)
-                    logging.debug(f"Saved batch number {batch_id}")
+                    logging.info(f"Saved batch number {batch_id} with {len(buffer)} records")
                     buffer = []
                     batch_id += 1
         
         # Remaining rows at the end
         if buffer:
             self.save_batch(batch=buffer, batch_id=batch_id)
-            logging.debug(f"Saved final batch number {batch_id}")
+            logging.info(f"Saved final batch number {batch_id} with {len(buffer)} records")
 
         time_duration = (time.time() - time_start) / 60
         logging.info(f"Finished. Running scrape took {int(np.around(time_duration, 0))} minutes.")
