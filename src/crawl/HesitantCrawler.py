@@ -158,15 +158,27 @@ class HesitantCrawler(BaseCrawler):
 
         # parse the url
         parsed = urlparse(url)
+        domain = parsed.netloc
 
         # dead ends for queue
+        is_deadend = False
         if from_sitemap:
             is_deadend = True  # won't be added to queue if from sitemap tree
-        else:
-            # if we have left the original domain, it'll be a dead end:
-            #   we allow the result to be a targeted result, but prevent it from further crawling
-            is_deadend = True if (parsed.netloc != self._istargeted[parent_url]['domain']) else False
-            logging.debug(f"Result of check if the URL is a dead end: {is_deadend}")
+        
+        if domain != self.start_domain:
+            if domain != self._istargeted[parent_url]['domain']:
+                if self._istargeted[parent_url]['domain'] != self.start_domain:
+                    # In this case we have jumped to a third domain, not allowed at all! 
+                    logging.debug("Deviated from domain twice, url is not allowed")
+                    return
+                else:
+                    # In this case we jumped the first time, allowed and we still like to crawl that site actually
+                    pass
+            # TODO: check if following should be done? What if on a job board the link goes to vacancies of a different company?
+            # else:
+            #     # We are still on the domain after the first jump, allowed to be targeted but no more crawl
+            #     is_deadend = True
+        logging.debug(f"Result of check if the URL is a dead end: {is_deadend}")
 
         # determine if it is targeted
         first_keyword_hit = self.find_target(parsed=parsed)
@@ -186,7 +198,7 @@ class HesitantCrawler(BaseCrawler):
         if is_targeted:
             logging.info(f"Found a targeted URL: {url}")
             logging.debug("Adding the URL to our list with results")
-            self._results.add(CrawlResult(url=url, source="NoCrawler", targeted=True, first_keyword_hit=first_keyword_hit))
+            self._results.append(CrawlResult(url=url, source="NoCrawler", targeted=True, first_keyword_hit=first_keyword_hit))
 
         # May anyways be added to queue of URLs to visit for more URLS
         if (depth <= self.max_depth) and (not is_deadend) and (not from_sitemap):

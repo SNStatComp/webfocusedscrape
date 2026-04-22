@@ -1,6 +1,7 @@
 from abc import ABC, abstractmethod
 from typing import NamedTuple, List
 import logging
+from urllib.parse import urlparse
 
 from fetch import IFetcher
 
@@ -43,10 +44,12 @@ class BaseCrawler(ICrawler):
     def __init__(self, fetcher: IFetcher):
         super(BaseCrawler, self).__init__(fetcher=fetcher)
         self.start_url = ""
+        self.start_domain = ""
+        self.crawl_delay = 2
 
     def reset_results(self):
         logging.debug("Crawler is (re)set with empty results")
-        self._results = set()  # for output
+        self._results = []  # for output
         self._queue = []  # for next visits
         self._visited = dict()  # to keep track of visited pages
         self._istargeted = dict()  # will keep track of urls and if they met targeting conditions
@@ -61,6 +64,8 @@ class BaseCrawler(ICrawler):
             start_url = f"https://{start_url}"
             logging.info(f"Prefix 'https://' added to start URL: {start_url}")
         self.start_url = start_url
+
+        self.start_domain = urlparse(start_url).netloc
 
     def get_results(self) -> List[CrawlResult]:
         """Return list of crawled URLs"""
@@ -84,7 +89,7 @@ class NoCrawler(BaseCrawler):
     def crawl(self):
         logging.info("Just adding start-url to the results")
         result = CrawlResult(url=self.start_url, source="NoCrawler")
-        self._results.add(result)
+        self._results.append(result)
 
 
 if __name__ == "__main__":
