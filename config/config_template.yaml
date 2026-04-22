@@ -26,3 +26,5 @@ output:
 crawl:
   max_duration: 500
   max_visits: 200
+  max_depth: 2
+  use_sitemap: True
