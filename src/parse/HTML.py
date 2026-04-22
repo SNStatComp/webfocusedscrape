@@ -37,14 +37,18 @@ class HTMLBodyParser(IHTMLParser):
         logging.debug(f"Extractor disregards tags: {', '.join(self._disregard)}")
 
     def parse(self, html: str) -> str:
-        soup = BeautifulSoup(html, "html.parser")
+        try: 
+            soup = BeautifulSoup(html, "html.parser")
 
-        # Remove non-content, basic start
-        for tag in soup(self._disregard):
-            tag.decompose()
-        text = soup.get_text(separator="\n", strip=True)
-        logging.debug(f"First 100 characters of text extracted: {text[0:100]}")
-        return text
+            # Remove non-content, basic start
+            for tag in soup(self._disregard):
+                tag.decompose()
+            text = soup.get_text(separator="\n", strip=True)
+            logging.debug(f"First 100 characters of text extracted: {text[0:100]}")
+            return text
+        except Exception as e:
+            # Handle exceptions
+            logging.debug(f"Parsing HTML failed for {url}. Error: {e}")
 
 
 if __name__ == "__main__":
