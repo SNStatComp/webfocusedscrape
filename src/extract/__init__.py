@@ -1,1 +1,0 @@
-from extract.Extractor import MainContentExtractor, EmptystringExtractor
