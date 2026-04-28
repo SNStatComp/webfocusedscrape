@@ -205,6 +205,12 @@ class HesitantCrawler(BaseCrawler):
             logging.debug(f"Adding the URL to queue vor visiting with depth={depth} at max_depth={self.max_depth}")
             self._queue.append(url)
     
+    def order_queue(self):
+        """Reorder elements in queue by ascending depth of URL, so that targeted URLs are visited first"""
+
+        if len(self._queue) > 0:
+            self._queue = sorted(self._queue, key=lambda x: self._istargeted.get(x, {'depth': np.inf})['depth'])
+    
     def crawl(self):
         """
         Main crawling function
@@ -255,6 +261,9 @@ class HesitantCrawler(BaseCrawler):
             logging.debug("Waiting for delay to pass")
             time.sleep(self.crawl_delay)
             logging.debug("Delay has passed")
+
+            # order queue by depth, ascending - so that targeted URLs are crawled before the ones further removed
+            self.order_queue()
         
         # Crawl stopped
         logging.debug(f"Crawl stopped after {np.around(duration, 0)} seconds, with max duration {self.max_duration} seconds")
