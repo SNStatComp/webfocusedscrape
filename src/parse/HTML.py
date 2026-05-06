@@ -48,7 +48,7 @@ class HTMLBodyParser(IHTMLParser):
             return text
         except Exception as e:
             # Handle exceptions
-            logging.debug(f"Parsing HTML failed for {url}. Error: {e}")
+            logging.debug(f"Parsing HTML failed. Error: {e}")
 
 
 if __name__ == "__main__":
