@@ -39,6 +39,8 @@ if __name__ == "__main__":
 
     main()
 
+    logging.info("Exiting with no error")
+
     # # Read the output files by using the following syntax:
     # CONFIG = setup("../config/config.yaml")
     # df = pd.read_parquet(f"{CONFIG.output.output_dir}/20260304_080625", engine="pyarrow")

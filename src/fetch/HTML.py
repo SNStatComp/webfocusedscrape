@@ -6,6 +6,9 @@ import urllib
 from urllib.parse import urlparse
 import logging
 
+import extruct
+from w3lib.html import get_base_url
+
 from util import setup
 from .base import IFetcher
 
@@ -43,6 +46,7 @@ class HTMLFetcher(IFetcher):
             "Accept-Encoding": "identity",
             "Connection": "keep-alive"
         }
+
         headers_str = ', '.join([f"{k}: {v}" for k, v in self.headers.items()])
         logging.debug(f"Request headers set to {headers_str}")
 
@@ -108,8 +112,41 @@ class HTMLFetcher(IFetcher):
 
             # Success
             result = response.text
-            self.results[url] = result
-            return result
+
+            # Base URL is needed to resolve relative URLs in the metadata
+            base_url = get_base_url(result, response.url)
+            # Extract JSON-LD
+            schema_indicator = False
+            try:
+                data = extruct.extract(result, base_url=base_url)
+
+                # Filter out empty formats
+                found_schema = {k: v for k, v in data.items() if v}
+
+                if found_schema:
+                    for format_type in found_schema:
+                        if format_type == "json-ld":
+                            for el in found_schema["json-ld"]:
+                                if "@context" in el.keys():
+                                    if "@type" in el.keys():
+                                        if el["@type"] == CONFIG.crawl.schema.keyword:
+                                            logging.info(f"Element {CONFIG.crawl.schema.keyword} found using schema.org for base url: {base_url}")
+                                            print(f"{CONFIG.crawl.schema.keyword} found using schema.org for base url: {base_url}")
+                                            schema_indicator = True
+                                    if "@graph" in el.keys():
+                                        for graphel in el["@graph"]:
+                                            if graphel["@type"] == CONFIG.crawl.schema.keyword:
+                                                logging.info(f"Graph element {CONFIG.crawl.schema.keyword} found using schema.org for base url: {base_url}")
+                                                print(f"Graph {CONFIG.crawl.schema.keyword} found using schema.org for base url: {base_url}")
+                                                schema_indicator = True
+            except Exception:
+                pass
+
+            if CONFIG.crawl.schema.keyword in result:
+                logging.debug(f"Found schema keyword: {CONFIG.crawl.schema.keyword} in HTML for url: {url}, possible schema org?")
+
+            self.results[url] = (result, schema_indicator)
+            return result, schema_indicator
 
         except requests.exceptions.RequestException as e:
             # Handle exceptions
