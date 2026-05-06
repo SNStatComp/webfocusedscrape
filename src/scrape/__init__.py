@@ -2,7 +2,7 @@ import logging
 from scrape.base import IScraper, Scraper
 from util import setup
 
-CONFIG = setup("../config/config.yaml")
+CONFIG = setup("config/config.yaml")
 
 
 def build_webfocusedscraper(user_agent: str) -> IScraper:

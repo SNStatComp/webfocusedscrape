@@ -9,7 +9,7 @@ import logging
 from util import setup
 from .base import IFetcher
 
-CONFIG = setup("../config/config.yaml")
+CONFIG = setup("config/config.yaml")
 
 
 class HTMLFetcher(IFetcher):
