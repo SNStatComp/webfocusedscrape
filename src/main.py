@@ -8,7 +8,7 @@ import time
 from scrape import build_webfocusedscraper
 
 
-CONFIG = setup("../config/config.yaml")
+CONFIG = setup("config/config.yaml")
 
 
 def main():
@@ -38,6 +38,8 @@ if __name__ == "__main__":
     logging.info(OmegaConf.to_yaml(CONFIG))
 
     main()
+
+    logging.info("Exiting with no error")
 
     # # Read the output files by using the following syntax:
     # CONFIG = setup("../config/config.yaml")

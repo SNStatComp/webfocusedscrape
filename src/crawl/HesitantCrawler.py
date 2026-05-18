@@ -2,6 +2,7 @@ from typing import List
 import time
 import logging
 import re
+import validators
 
 import numpy as np
 from urllib.parse import urlparse, urljoin
@@ -11,7 +12,7 @@ from .base import BaseCrawler, CrawlResult
 from fetch import HTMLFetcher
 from util import setup
 
-CONFIG = setup("../config/config.yaml")
+CONFIG = setup("config/config.yaml")
 
 
 class HesitantCrawler(BaseCrawler): 
@@ -94,7 +95,7 @@ class HesitantCrawler(BaseCrawler):
         if url in self._visited:
             logging.debug(f"Skip {url}, because we have visited it before")
             return True  # skip
-        return False 
+        return False
 
     def find_urls(self, url: str, html: str) -> str:
         """
@@ -144,6 +145,10 @@ class HesitantCrawler(BaseCrawler):
     
     def process_url(self, url: str, parent_url: str, from_sitemap: bool = False):
         """check url for target and then add to results and queue"""
+
+        if not validators.url(url):
+            logging.debug(f"Invalid url: {url}")
+            return
 
         if url in self._istargeted:
             return
@@ -246,13 +251,16 @@ class HesitantCrawler(BaseCrawler):
                 continue
 
             # Fetch from visting URL, will check robots if it is allowed (as part of Fetcher class)
-            visiting_html = self._fetcher.fetch(url=visiting_url)
-            self._visited[visiting_url] = visiting_html  # even if nothing found, keep track of what we have tried
-            if len(visiting_html) == 0:  # Nothing returned
-                continue
+            try:
+                visiting_html, schema_indicator = self._fetcher.fetch(url=visiting_url)
+                self._visited[visiting_url] = visiting_html  # even if nothing found, keep track of what we have tried
+                if len(visiting_html) == 0:  # Nothing returned
+                    continue
 
-            for found_url in self.find_urls(url=visiting_url, html=visiting_html):
-                self.process_url(url=found_url, parent_url=visiting_url)
+                for found_url in self.find_urls(url=visiting_url, html=visiting_html):
+                    self.process_url(url=found_url, parent_url=visiting_url)
+            except Exception:
+                continue
 
             # At the end, measure how long we've been busy so far
             duration = time.time() - start_time

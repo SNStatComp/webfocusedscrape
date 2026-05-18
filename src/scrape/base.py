@@ -6,13 +6,14 @@ import numpy as np
 from typing import List
 from datetime import datetime
 import time
+import random
 
 from util import setup
 from fetch import IFetcher
 from crawl import ICrawler
 from parse import IHTMLParser
 
-CONFIG = setup("../config/config.yaml")
+CONFIG = setup("config/config.yaml")
 
 
 class IScraper(ABC):
@@ -49,6 +50,7 @@ class Scraper(IScraper):
         with open(file_urls, 'r', encoding='utf-8') as file_in:
             self._base_urls = [line.rstrip() for line in file_in]
         self._base_urls = self._base_urls[CONFIG.input.url_offset:CONFIG.input.url_offset + CONFIG.input.url_max]
+        random.shuffle(self._base_urls)
         logging.debug(f"Read list with {len(self._base_urls)} base-urls from file: {file_urls}")
         logging.debug(f"Scraper will start with entry {CONFIG.input.url_offset + 1} in the file")
 
@@ -96,11 +98,14 @@ class Scraper(IScraper):
             # After crawl, collect results and parse content of targeted sites
             # Some urls will already have their html fetched before during crawl, don't redo this then
             for crawlresult in self._crawler.get_results():
-
+                schema_indicator = False
                 html = self._crawler._visited.get(crawlresult.url, False)
                 if not html:
                     logging.debug(f"Downloading html from yet unvisited url {crawlresult.url}")
-                    html = self._fetcher.fetch(crawlresult.url)
+                    try:
+                        html, schema_indicator = self._fetcher.fetch(crawlresult.url)
+                    except Exception:
+                        html = ""
                     # Respect crawl delay if crawler dose that
 
                     logging.debug("Waiting for delay to pass")
@@ -108,7 +113,7 @@ class Scraper(IScraper):
                     logging.debug("Delay has passed")
                 
                 content = self._htmlparser.parse(html=html)
-                if len(content) > 0:
+                if content is not None and len(content) > 0:
                     if content in seen_content:  # No dupliactes
                         logging.debug(f"Content from {crawlresult.url} is a duplicate, not added to output")
                         continue
@@ -118,7 +123,8 @@ class Scraper(IScraper):
                         "base_url": base_url,
                         "url": crawlresult.url,
                         "first_keyword_hit": crawlresult.first_keyword_hit,
-                        "content": content
+                        "content": content,
+                        "schema_indicator": schema_indicator
                     })
                 else:
                     logging.debug(f"After parsing no output for url {crawlresult.url}")
