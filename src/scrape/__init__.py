@@ -16,12 +16,17 @@ def build_webfocusedscraper(user_agent: str) -> IScraper:
     with open(f"{CONFIG.input.input_dir}/{CONFIG.input.input_files.keywords}", 'r', encoding='utf-8') as file_in:
         target_keywords = [line.rstrip() for line in file_in]
 
+    with open(f"{CONFIG.input.input_dir}/{CONFIG.input.input_files.skip_domains}", 'r', encoding='utf-8') as file_in:
+        skip_domains = [line.rstrip() for line in file_in]
+
     fetcher = HTMLFetcher(user_agent=user_agent)
     crawler = HesitantCrawler(
         fetcher=fetcher,
         target_keywords=target_keywords,
         add_sitemapurls=CONFIG.crawl.use_sitemap,
-        max_depth=CONFIG.crawl.max_depth)
+        max_depth=CONFIG.crawl.max_depth,
+        skip_domains=skip_domains
+    )
     htmlparser = HTMLBodyParser()
 
     return Scraper(

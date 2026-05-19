@@ -21,7 +21,8 @@ class HesitantCrawler(BaseCrawler):
             fetcher: HTMLFetcher,
             target_keywords: List[str],
             add_sitemapurls: bool = False,
-            max_depth: int = 1):
+            max_depth: int = 1,
+            skip_domains: List[str] = []):
         """
         Depth-limited Search Targeted Crawler
         Crawler class for obtaining urls from start_url.
@@ -64,6 +65,10 @@ class HesitantCrawler(BaseCrawler):
         self.target_keywords = target_keywords
         logging.info(f"The targeted crawl will look for given keywords: {', '.join(self.target_keywords)}")
 
+        # Skip domains
+        self.skip_domains = skip_domains
+        logging.info(f"The targeted crawl will skip domains: {', '.join(self.skip_domains)}")
+
         # Excluded URLs which contain:
         self._unsupported = (
             ".ics", ".mng", ".pct", ".bmp", ".gif", ".jpg", ".jpeg", ".png", ".pst", ".psp", ".tif", ".tiff", ".drw", ".dxf", ".eps",
@@ -90,6 +95,10 @@ class HesitantCrawler(BaseCrawler):
 
         # prevent duplicate crawl from trailing forward slash in URL
         url = url.rstrip('/') if url.endswith('/') else url
+
+        if any([skip_domain in url for skip_domain in self.skip_domains]):
+            logging.debug(f"Skip {url}, because domain is in skip-list")
+            return True # skip
 
         # Do not revisit pages
         if url in self._visited:
