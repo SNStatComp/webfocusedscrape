@@ -14,6 +14,7 @@ requests:
 input:
   input_dir: ../input
   input_files:
+    skip_domains:
     urls: urls.txt
     keywords: keywords.txt
   url_max: 100
