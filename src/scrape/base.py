@@ -12,7 +12,7 @@ from fetch import IFetcher
 from crawl import ICrawler
 from parse import IHTMLParser
 
-CONFIG = setup("../config/config.yaml")
+CONFIG = setup("config/config.yaml")
 
 
 class IScraper(ABC):
@@ -108,7 +108,7 @@ class Scraper(IScraper):
                     logging.debug("Delay has passed")
                 
                 content = self._htmlparser.parse(html=html)
-                if len(content) > 0:
+                if content is not None and len(content) > 0:
                     if content in seen_content:  # No dupliactes
                         logging.debug(f"Content from {crawlresult.url} is a duplicate, not added to output")
                         continue

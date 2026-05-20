@@ -8,7 +8,7 @@ import time
 from scrape import build_webfocusedscraper
 
 
-CONFIG = setup("../config/config.yaml")
+CONFIG = setup("config/config.yaml")
 
 
 def main():
