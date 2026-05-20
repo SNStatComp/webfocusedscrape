@@ -252,7 +252,7 @@ class HesitantCrawler(BaseCrawler):
 
             # Fetch from visting URL, will check robots if it is allowed (as part of Fetcher class)
             try:
-                visiting_html = self._fetcher.fetch(url=visiting_url)
+                visiting_html, schema_indicator = self._fetcher.fetch(url=visiting_url)
                 self._visited[visiting_url] = visiting_html  # even if nothing found, keep track of what we have tried
                 if len(visiting_html) == 0:  # Nothing returned
                     continue
