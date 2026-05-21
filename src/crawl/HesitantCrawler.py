@@ -96,6 +96,9 @@ class HesitantCrawler(BaseCrawler):
         # prevent duplicate crawl from trailing forward slash in URL
         url = url.rstrip('/') if url.endswith('/') else url
 
+        # prevent duplicate crawl from '#' such as '#content', '#main', etc.
+        url = url.rstrip("#") if url.contains("#") else url
+
         if any([skip_domain in url for skip_domain in self.skip_domains]):
             logging.debug(f"Skip {url}, because domain is in skip-list")
             return True # skip

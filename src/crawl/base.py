@@ -2,7 +2,7 @@ from abc import ABC, abstractmethod
 from typing import NamedTuple, List
 import logging
 from urllib.parse import urlparse
-
+from scrapy.http import Response
 from fetch import IFetcher
 
 
@@ -11,6 +11,7 @@ class CrawlResult(NamedTuple):
     source: str
     targeted: bool = None
     first_keyword_hit: str = None
+    crawl_depth: int = 0
 
 
 class ICrawler(ABC):
