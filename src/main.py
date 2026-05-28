@@ -37,10 +37,15 @@ if __name__ == "__main__":
     logging.info("Config:")
     logging.info(OmegaConf.to_yaml(CONFIG))
 
+    start_time = time.perf_counter()
+
     main()
 
     logging.info("Exiting with no error")
 
+    end_time = time.perf_counter()
+
+    print("Runtime: ", end_time - start_time)
     # # Read the output files by using the following syntax:
     # CONFIG = setup("../config/config.yaml")
     # df = pd.read_parquet(f"{CONFIG.output.output_dir}/20260304_080625", engine="pyarrow")

@@ -44,7 +44,7 @@ class HTMLBodyParser(IHTMLParser):
             for tag in soup(self._disregard):
                 tag.decompose()
             text = soup.get_text(separator="\n", strip=True)
-            logging.debug(f"First 100 characters of text extracted: {text[0:100]}")
+            #logging.debug(f"First 100 characters of text extracted: {text[0:100]}")
             return text
         except Exception as e:
             # Handle exceptions
