@@ -137,6 +137,8 @@ if __name__ == "__main__":
     logging.debug(f"Total number of base-urls with scraped content: {len(get_baseurls(df=total))}.")
     logging.debug(f"Total number of pages downloaded: {total.shape[0]}.")
 
+    dfs.to_parquet("output/output.parquet")
+
     gr = total.groupby(by='base_url', as_index=False)['url'].count()
     gr = gr.rename(columns={'url': 'pages', 'base_url': 'count'})
     gr = gr.groupby(by='pages', as_index=False).count()
