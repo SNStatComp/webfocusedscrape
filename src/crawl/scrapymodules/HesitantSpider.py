@@ -1,11 +1,17 @@
-from typing import List
-import scrapy
-import validators
-from urllib.parse import urljoin, urlparse
+import json
 import re
+import scrapy
+import time
+import validators
+
 import pandas as pd
-from .ScrapyResult import ScrapyResult
+
+from scrapy.exceptions import CloseSpider
+from typing import List
+from urllib.parse import urljoin, urlparse
+
 from parse import HTMLBodyParser
+from .ScrapyResult import ScrapyResult
 
 
 class HesitantSpider(scrapy.Spider):
@@ -16,27 +22,31 @@ class HesitantSpider(scrapy.Spider):
         "USER_AGENT": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36",
         "AUTOTHROTTLE_ENABLED": True,  # Auto throttle to maximize speed without risking blocks
         "AUTOTHROTTLE_START_DELAY": 1.0,  # Start slow to "warm up"
-        "AUTOTHROTTLE_MAX_DELAY": 10.0,   # Never wait more than 10s
+        "AUTOTHROTTLE_MAX_DELAY": 30.0,   # Never wait more than 10s
         "AUTOTHROTTLE_TARGET_CONCURRENCY": 1.0,  # Aim for 1 request per worker at a time
         "DOWNLOAD_DELAY": 0,               # Let Autothrottle handle the delay
     }
 
     def __init__(
         self,
-        start_urls: str,
-        target_keywords: List[str] = [],
-        add_sitemap_urls: bool = False,
-        max_depth: int = 1,
-        skip_domains: List[str] = [],
-        skip_paths: List[str] = [],
-        allowed_top_level_domains: List[str] = [".com"],
-        batch_size: int = 100,
-        output_file: str = "output.parquet",
-        max_jumps: int = 1,
+        start_urls: List[str],  # List of starting (base) urls
+        target_keywords: List[str] = [],  # list of keywords to determine targeting of URLs
+        max_depth: int = 2,  # Maximum crawling depth with hesitancy
+        skip_domains: List[str] = [],  # List of domains to skip
+        skip_paths: List[str] = [],  # List of in-website paths to skip
+        allowed_top_level_domains: List[str] = [".com"],  # List of allowed top level domains
+        batch_size: int = 100,  # Output batch size
+        output_file: str = "output.parquet",  # Output file name
+        max_jumps: int = 1,  # Maximum site-to-site jumps
+        timeout: int = 3600,  # max time in seconds
+        allowed_languages: List[str] = ["en", "en-us", "en-gb", "en-uk"],  # Allowed languages within url paths
+        allowed_countries: List[str] = ["en", "us", "gb", "eu"],  # Allowed countries within url paths
+        schema_keywords: List[str] = [],  # Schema.org keywords to look for 
         *args, **kwargs
     ):
         super(HesitantSpider, self).__init__(*args, **kwargs)
 
+        # Set and log attributes
         self.start_urls = start_urls
         self.logger.debug(f"Init start_urls: {self.start_urls}")
         self.max_depth = max_depth
@@ -50,14 +60,25 @@ class HesitantSpider(scrapy.Spider):
         self.target_keywords = target_keywords
         self.logger.debug(f"Init target keywords: {self.target_keywords}")
         self.batch_size = batch_size
-        self.batch_counter = 0
         self.logger.debug(f"Init batch_size: {self.batch_size}")
-
+        self.allowed_languages = allowed_languages
+        self.logger.debug(f"Init allowed languages: {self.allowed_languages}")
+        self.allowed_countries = allowed_countries
+        self.logger.debug(f"Init allowed countries: {self.allowed_countries}")
+        self.schema_keywords = schema_keywords
+        self.logger.debug(f"Init schema keywords: {self.schema_keywords}")
         self.max_jumps = max_jumps
-
+        self.logger.debug(f"Init max_jumps: {self.max_jumps}")
         self.output_file = output_file
         self.logger.debug(f"Init output file: {self.output_file}")
 
+        # Start batch counter
+        self.batch_counter = 0
+
+        # Set timeout
+        self.timeout = timeout
+
+        # Set parser and unsupported endpoints
         self._htmlparser = HTMLBodyParser()
         self._unsupported = (
             ".ics", ".mng", ".pct", ".bmp", ".gif", ".jpg", ".jpeg", ".png", ".pst", ".psp", ".tif", ".tiff", ".drw", ".dxf", ".eps",
@@ -76,6 +97,7 @@ class HesitantSpider(scrapy.Spider):
             ".dmg?download=true")
         self.logger.debug(f"URLs will be excluded if they contain any in path:{', '.join(self._unsupported)}")
 
+        # Init batch, results, visited 
         self.batch = []
         self.results = []
         self.visited = set()
@@ -83,7 +105,10 @@ class HesitantSpider(scrapy.Spider):
         if max_depth < 0:
             self.logger.debug("Only urls from starting_url can be found, max_depth < 0")
 
+    # Asynchronous function that starts the crawl
     async def start(self):
+        self.start_time = time.time()
+        # For each start url, start crawling
         for start_url in self.start_urls:
             yield scrapy.Request(
                 url=start_url,
@@ -96,6 +121,7 @@ class HesitantSpider(scrapy.Spider):
                 }
             )
 
+    # Save current batch to disk
     def save_batch(self):
         if len(self.batch) == 0:
             self.logger.debug("Tried to save batch without any results..")
@@ -107,18 +133,23 @@ class HesitantSpider(scrapy.Spider):
             "first_keyword_hit": [res.first_keyword_hit for res in self.batch],
             "content": [res.content for res in self.batch],
             "crawl_depth": [res.crawl_depth for res in self.batch],
-            "schema_indicator": [res.schema_indicator for res in self.batch]  # TODO now always false
+            "schema_indicator": [res.schema_indicator for res in self.batch]
         })
 
         df.to_parquet(
-            self.output_file.replace(".parquet", f"_{self.batch_counter}.parquet")  # TODO name
+            self.output_file.replace(".parquet", f"_{self.batch_counter}.parquet")
         )
 
         self.batch_counter += 1
 
-        self.batch = []
-        self.logger.debug("Saved batch to parquet")
+        # Add batch to total results
+        self.results += self.batch
 
+        # Empty batch
+        self.batch = []
+        self.logger.debug(f"Saved batch to parquet, total results: {len(self.results)}")
+
+    # Determine whether or not URL is a target
     def url_is_target(self, url: str) -> bool:
         parsed_url = urlparse(url).path
         for keyword in self.target_keywords:
@@ -129,13 +160,9 @@ class HesitantSpider(scrapy.Spider):
 
         return False, None
 
+    # Determine whether or not to skip URL
     def skip_this_url(self, url: str) -> bool:
-        """Function to see if we have already visited url"""
-
-        # Do not revisit pages
-        if url in self.visited:
-            self.logger.debug(f"Skip {url}, because we have visited it before")
-            return True  # skip
+        """Function to see if we skip url"""
 
         # Only visit valid urls
         if not validators.url(url):
@@ -147,7 +174,8 @@ class HesitantSpider(scrapy.Spider):
             return True
 
         # Only visit pages on allowed top-level domains
-        url_netloc = urlparse(url).netloc.lower()
+        parsed_url = urlparse(url)
+        url_netloc = parsed_url.netloc.lower()
 
         if not any([url_netloc.endswith(toplevel_domain) for toplevel_domain in self.allowed_top_level_domains]):
             self.logger.debug(f"Skip {url} with netloc {url_netloc}, because top-level domain is not in allowed list")
@@ -164,54 +192,102 @@ class HesitantSpider(scrapy.Spider):
             self.logger.debug(f"Skip {url}, because domain is in skip-list")
             return True  # skip
 
+        # Skip if first path is a country code but not within allowed
+        paths = urlparse(url).path.split("/")
+        if len(paths) >= 2:
+            if len(paths[1]) == 2 and paths[1] not in self.allowed_countries:
+                self.logger.debug(f"Skip {url} because path /{paths[1]}/ indicates country-page not in allowed countries: {self.allowed_countries}")
+                return True
+
         # skip pre-defined paths
         for skip_path in self.skip_paths:
-            if any([path == skip_path for path in urlparse(url).path.split("/")]):
+            if any([path == skip_path for path in paths]):
                 self.logger.debug(f"Skip {url} because path {urlparse(url).path} contains skip-path: {skip_path}")
                 return True
-            
+
+        # Skip pages in unsupported languages
+        query_params = parsed_url.query.split("&")
+        if len(self.allowed_languages) > 0:
+            for query_param in query_params:
+                if "lang=" in query_param:
+                    lang = query_param.split("lang=")[1]
+                    if lang not in self.allowed_languages:
+                        self.logger.debug(f"Skip {url} due to language parameter 'lang={lang}' not in allowed list: {self.allowed_languages}")
+                        return True
+                elif "language=" in query_param:
+                    language = query_param.split("language=")[1]
+                    if language not in self.allowed_languages:
+                        self.logger.debug(f"Skip {url} due to language parameter 'language={language}' not in allowed list: {self.allowed_languages}")
+                        return True
+
         return False
 
+    # Process request response
     def parse(self, response):
-        self.visited.add(response.url)
-
+        # Check if we passed timeout
+        if time.time() - self.start_time > self.timeout:
+            print(f"Hit timeout {self.timeout} seconds for spider with start urls: {self.start_urls}!")
+            self.logger.debug(f"Hit timeout {self.timeout} seconds for spider with start urls: {self.start_urls}!")
+            raise CloseSpider('bandwidth_exceeded')
         current_depth = response.meta.get("depth", 0)
 
+        # Check if url is tagret
         url_is_targeted, first_keyword_hit = self.url_is_target(response.url)
 
+        # If url is not target and exceeds hesitancy depth, return
         if not url_is_targeted and current_depth >= self.max_depth:
             return
 
+        # Determine whether we need to add a jump
         jumps = response.meta.get("jumps", 0)
 
         parsed_url = urlparse(response.url)
         current_netloc = parsed_url.netloc.lower().rsplit(".", 1)[0]
         meta_netloc = urlparse(response.meta.get("current_start")).netloc.lower().rsplit(".", 1)[0]
-        if current_netloc != meta_netloc:
+        if current_netloc != meta_netloc and response.meta.get("redirect_urls") is None:
             self.logger.debug(f"Adding jump from {jumps} to {jumps + 1} going with base url: {meta_netloc} to {current_netloc}")
             jumps += 1
-            # TODO do not add jump if response is a HTTP 300 redirect 
-     
+
+        # If we exceed jumps, return
         if jumps > self.max_jumps:
             self.logger.debug(f"Ending crawl path due to exceeding jumps ({jumps}/{self.max_jumps}) for {response.url}, base url: {response.meta.get("base_url")}")
             return
 
+        # Process response if above skip-conditions not met
         self.logger.debug(f"Parsing url: {response.url}, targeted: {url_is_targeted}, depth: {current_depth}, jumps: {jumps}")
+        self.visited.add(response.url)
 
         # Process the current page
         if url_is_targeted:
-            # Add results
+            # Determine schema.org indicator
+            schema_indicator = False
+
+            # Get JSON-LD elements
+            jsonlds = response.xpath("//script[@type='application/ld+json']/text()").getall()
+            if jsonlds:
+                for jsonld in jsonlds:
+                    try:
+                        data = json.loads(jsonld)
+                        if "@type" in data.keys() and data["@type"] in self.schema_keywords:
+                            self.logger.debug(f"Found schema entity {data["@type"]} that is within schema keywords: {self.schema_keywords}")
+                            schema_indicator = True
+                    except json.JSONDecodeError:
+                        pass
+
+            # Add result to batch
             result = ScrapyResult(
                     base_url=str(response.meta.get("base_url")),
                     url=response.url,
                     status=response.status,
                     first_keyword_hit=first_keyword_hit,
                     content=self._htmlparser.parse(html=response.text),
-                    crawl_depth=current_depth
+                    crawl_depth=current_depth,
+                    schema_indicator=schema_indicator
                 )
-            self.batch.append(result)
-            self.results.append(result)
 
+            self.batch.append(result)
+
+            # Save batch if exceeding batch size
             if len(self.batch) >= self.batch_size:
                 self.save_batch()
 
@@ -222,7 +298,7 @@ class HesitantSpider(scrapy.Spider):
         for link in response.css("a::attr(href)").getall():
             url = urljoin(response.url, link)
 
-            # Keep crawling restricted to the start domain and avoid skipped domains
+            # Only continue with valid crawl paths
             if self.skip_this_url(url):
                 continue
 
@@ -234,9 +310,11 @@ class HesitantSpider(scrapy.Spider):
                     "current_start": f"{parsed_url.scheme}://{parsed_url.netloc}",
                     "depth": current_depth + 1,
                     "jumps": jumps
-                }
+                },
+                dont_filter=False  # Skip duplicates
             )
 
+    # Called when the spider closes cleanly
     def closed(self, reason):
-        """Optional: Scrapy built-in method called when the spider finishes"""
+        self.save_batch()
         print(f"Spider closed because of: {reason}. Total collected pages: {len(self.batch)}")
