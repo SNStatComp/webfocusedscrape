@@ -3,6 +3,7 @@ import re
 import scrapy
 import time
 import validators
+import logging
 
 import pandas as pd
 
@@ -42,6 +43,7 @@ class HesitantSpider(scrapy.Spider):
         allowed_languages: List[str] = ["en", "en-us", "en-gb", "en-uk"],  # Allowed languages within url paths
         allowed_countries: List[str] = ["en", "us", "gb", "eu"],  # Allowed countries within url paths
         schema_keywords: List[str] = [],  # Schema.org keywords to look for 
+        sitemaps_tocheck: List[str] = ['sitemap.xml'],  # path extensions that often lead to sitemaps to check for URL's
         *args, **kwargs
     ):
         super(HesitantSpider, self).__init__(*args, **kwargs)
@@ -71,6 +73,8 @@ class HesitantSpider(scrapy.Spider):
         self.logger.debug(f"Init max_jumps: {self.max_jumps}")
         self.output_file = output_file
         self.logger.debug(f"Init output file: {self.output_file}")
+        self.sitemaps_tocheck = sitemaps_tocheck
+        self.logger.debug(f"Check urls found on (potential) sitemaps: {self.sitemaps_tocheck}")
 
         # Start batch counter
         self.batch_counter = 0
@@ -120,6 +124,20 @@ class HesitantSpider(scrapy.Spider):
                     "jumps": 0
                 }
             )
+            # next, if desired, check the sitemapurls to augment existing results
+            parsed_url = urlparse(start_url)
+            for sitemap in self.sitemaps_tocheck:
+                url = f"{parsed_url.scheme}://{parsed_url.netloc}/{sitemap}"
+                yield scrapy.Request(
+                    url=url,
+                    callback=self.parse_sitemap,
+                    meta={
+                        "base_url": start_url,
+                        "current_start": start_url,
+                        "depth": 0,
+                        "jumps": 0
+                    }
+                )
 
     # Save current batch to disk
     def save_batch(self):
@@ -313,8 +331,94 @@ class HesitantSpider(scrapy.Spider):
                 },
                 dont_filter=False  # Skip duplicates
             )
+    
+    def parse_sitemap(self, response):
+        # Extract all URLs from the sitemap, accounting for namespace
+        ns = {'ns': 'http://www.sitemaps.org/schemas/sitemap/0.9'}
+        urls = response.xpath('//ns:url/ns:loc/text()', namespaces=ns).getall()
+
+        for url in urls:
+            # Only continue with valid crawl paths
+            if self.skip_this_url(url):
+                continue
+            
+            parsed_url = urlparse(url)
+            yield scrapy.Request(
+                    url=url,
+                    callback=self.parse,
+                    meta={
+                        "base_url":  response.meta.get("base_url"),
+                        "current_start": f"{parsed_url.scheme}://{parsed_url.netloc}",
+                        "depth": response.meta.get("depth", 0) + 1
+                    }
+                )
 
     # Called when the spider closes cleanly
     def closed(self, reason):
         self.save_batch()
-        print(f"Spider closed because of: {reason}. Total collected pages: {len(self.batch)}")
+        print(f"Spider closed because of: {reason}. Total collected pages: {len(self.results)}")
+
+
+if __name__ == "__main__":
+    import os
+    from datetime import datetime
+    from scrapy.crawler import CrawlerProcess
+    from util import setup
+
+    CONFIG = setup("config/config.yaml")
+
+    logging_level = logging.DEBUG
+
+    dir_log = f"{CONFIG.output.output_dir}/{CONFIG.output.logs}"
+    if not os.path.exists(dir_log):
+        os.makedirs(dir_log)
+    logfile = f"{dir_log}/log_{datetime.now().strftime("%Y%m%d_%H%M%S")}.log"
+
+    # Create scrapy CrawlerProcess
+    process = CrawlerProcess(
+        settings={
+            "ROBOTSTXT_OBEY": True,
+            "LOG_FILE": logfile,
+            "DOWNLOADER_MIDDLEWARES": {
+                "src.crawl.scrapymodules.ScrapyCrawlMiddleware.TextTypeFilterMiddleware": 543  # High priority
+            },
+            "DOWNLOAD_CONTENT_TYPES": ["text/html", "application/xhtml+xml"]  # TODO can be removed?
+        }
+    )
+
+    # Create crawler from process
+    spiderCrawler = process.create_crawler(HesitantSpider)
+
+    # Crawl and configure spider
+    # urls = ['https://books.toscrape.com/']
+    # target_keywords = ["philosophy"]
+
+    urls = ['https://werkenbijhetcbs.nl/']
+    target_keywords = ["enqueteur"]
+    sitemaps_tocheck = ["sitemap.xml"]
+    allowed_top_level_domains = [".com", ".nl"]
+
+    # Skip domains
+    file_skip_domains = f"{CONFIG.input.input_dir}/{CONFIG.input.input_files.skip_domains}"
+    logging.info(f"Reading list of skip_domains from file: {file_skip_domains}")
+    with open(file_skip_domains, 'r', encoding='utf-8') as file_in:
+        skip_domains = [line.rstrip() for line in file_in]
+
+    # output
+    time_part = datetime.now().strftime("%Y%m%d_%H%M%S")
+    output_file = f"{CONFIG.output.output_dir}/{time_part}_output.parquet"
+
+    process.crawl(
+        spiderCrawler,
+        start_urls=urls,
+        target_keywords=target_keywords,
+        skip_domains=skip_domains,
+        allowed_top_level_domains=allowed_top_level_domains,
+        output_file=output_file,
+        sitemaps_tocheck=sitemaps_tocheck
+    )
+
+    try:
+        process.start()
+    except Exception as e:
+        print(f"Something went from starting process! Error {e}")
