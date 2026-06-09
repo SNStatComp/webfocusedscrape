@@ -115,6 +115,22 @@ def spawn_spider_process(urls, keywords, skip_domains, process_id, log_level, lo
 
 
 if __name__ == "__main__":
+
+    # Set logging level and create file
+    # All workers write to same log
+    logging_level = logging.DEBUG
+
+    dir_log = f"{CONFIG.output.output_dir}/{CONFIG.output.logs}"
+    if not os.path.exists(dir_log):
+        os.makedirs(dir_log)
+    logfile = f"{dir_log}/log_{datetime.now().strftime("%Y%m%d_%H%M%S")}.log"
+    logging.basicConfig(
+        filename=logfile,
+        level=logging_level,
+        format='%(asctime)s - %(levelname)s - %(message)s'
+    )
+    logging.info("Log file created.")
+
     # Input URLs
     file_urls = f"{CONFIG.input.input_dir}/{CONFIG.input.input_files.urls}"
     logging.info(f"Reading list of base-urls from file: {file_urls}")
@@ -144,9 +160,6 @@ if __name__ == "__main__":
 
     chunked_args = []
 
-    # All workers write to same log
-    logfile = f"output/logs/log_{datetime.now().strftime("%Y%m%d_%H%M%S")}.log"
-
     # Make output dir for specific run
     time_part = datetime.now().strftime("%Y%m%d_%H%M%S")
     if not os.path.exists(f"{CONFIG.output.output_dir}/{time_part}"):
@@ -159,7 +172,7 @@ if __name__ == "__main__":
                 target_keywords,
                 skip_domains,
                 i,
-                logging.DEBUG,
+                logging_level,
                 logfile,
                 f"{CONFIG.output.output_dir}/{time_part}/worker_{i}.parquet"  # Different output files per werker
             )
@@ -186,7 +199,6 @@ if __name__ == "__main__":
 
     if len(dfs) > 0:
         results = pd.concat(dfs, ignore_index=True)
-
-    print("#Results:", len(results))
+        print("#Results:", len(results))
 
     print("Runtime: ", end_time - start_time)
