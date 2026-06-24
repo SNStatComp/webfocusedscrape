@@ -37,9 +37,9 @@ def read_parquet_dir(parquet_dir):
                 yield df[df['content'].apply(is_valid_string)]
 
 
-# Spawn spider crawler process 
-def spawn_spider_process(urls, keywords, skip_domains, process_id, log_level, logfile, output_file):
-    print(f"Args: urls: {urls}, keywords: {keywords}, skip domains: {skip_domains}, log level {log_level}, log file: {logfile}, output file: {output_file}, process_id: {process_id}")
+# Spawn spider crawler process
+def spawn_spider_process(urls, netloc_keywords, path_keywords, skip_domains, process_id, log_level, logfile, output_file, schema_keywords):
+    print(f"Args: urls: {urls}, netloc keywords: {netloc_keywords}, path keywords: {path_keywords}, skip domains: {skip_domains}, log level: {log_level}, log file: {logfile}, output file: {output_file}, process_id: {process_id}")
     print(f"Starting crawling process (PID: {process_id}, OSPID: {os.getpid()}) for {urls}!")
     project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
     if project_root not in sys.path:
@@ -83,7 +83,8 @@ def spawn_spider_process(urls, keywords, skip_domains, process_id, log_level, lo
         spiderCrawler,
         start_urls=urls,
         max_depth=2,
-        target_keywords=keywords,
+        target_netloc_keywords=netloc_keywords,
+        target_path_keywords=path_keywords,
         skip_domains=skip_domains,
         output_file=output_file,
         allowed_top_level_domains=[".com", ".nl", ".ai", ".de", ".be", ".eu", ".io"],
@@ -97,7 +98,7 @@ def spawn_spider_process(urls, keywords, skip_domains, process_id, log_level, lo
         ],
         allowed_languages=["nl", "en", "en-uk", "en-gb"],
         allowed_countries=["nl"],
-        schema_keywords=["JobPosting"]
+        schema_keywords=schema_keywords
     )
 
     # If worker gets 0 urls, pass (shouldn't happen)
@@ -141,10 +142,15 @@ if __name__ == "__main__":
     urls = [*map(normalize_url, urls)]
 
     # Keywords
-    file_keywords = f"{CONFIG.input.input_dir}/{CONFIG.input.input_files.keywords}"
+    file_keywords = f"{CONFIG.input.input_dir}/{CONFIG.input.input_files.netloc_keywords}"
     logging.info(f"Reading list of keywords from file: {file_keywords}")
     with open(file_keywords, 'r', encoding='utf-8') as file_in:
-        target_keywords = [line.rstrip() for line in file_in]
+        target_netloc_keywords = [line.rstrip() for line in file_in]
+
+    file_keywords = f"{CONFIG.input.input_dir}/{CONFIG.input.input_files.path_keywords}"
+    logging.info(f"Reading list of keywords from file: {file_keywords}")
+    with open(file_keywords, 'r', encoding='utf-8') as file_in:
+        target_path_keywords = [line.rstrip() for line in file_in]
 
     # Skip domains
     file_skip_domains = f"{CONFIG.input.input_dir}/{CONFIG.input.input_files.skip_domains}"
@@ -169,12 +175,14 @@ if __name__ == "__main__":
         chunked_args.append(
             (
                 url_chunks[i],
-                target_keywords,
+                target_netloc_keywords,
+                target_path_keywords,
                 skip_domains,
                 i,
                 logging_level,
                 logfile,
-                f"{CONFIG.output.output_dir}/{time_part}/worker_{i}.parquet"  # Different output files per werker
+                f"{CONFIG.output.output_dir}/{time_part}/worker_{i}.parquet",  # Different output files per werker
+                [CONFIG.crawl.schema.keyword]
             )
         )
 
@@ -187,8 +195,7 @@ if __name__ == "__main__":
 
     end_time = time.perf_counter()
 
-
-# Results in tables
+    # Results in tables
     dir_parquets = f"{CONFIG.output.output_dir}/{time_part}/"
     parquet_dfs = read_parquet_dir(dir_parquets)
 

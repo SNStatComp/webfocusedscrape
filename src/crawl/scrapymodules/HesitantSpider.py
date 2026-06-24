@@ -12,6 +12,7 @@ from typing import List
 from urllib.parse import urljoin, urlparse
 
 from parse import HTMLBodyParser
+from util import normalize_url
 from .ScrapyResult import ScrapyResult
 
 
@@ -31,7 +32,8 @@ class HesitantSpider(scrapy.Spider):
     def __init__(
         self,
         start_urls: List[str],  # List of starting (base) urls
-        target_keywords: List[str] = [],  # list of keywords to determine targeting of URLs
+        target_netloc_keywords: List[str] = [], # List of keywords to determine targeting of URL netlocs
+        target_path_keywords: List[str] = [],  # list of keywords to determine targeting of URL paths
         max_depth: int = 2,  # Maximum crawling depth with hesitancy
         skip_domains: List[str] = [],  # List of domains to skip
         skip_paths: List[str] = [],  # List of in-website paths to skip
@@ -59,8 +61,10 @@ class HesitantSpider(scrapy.Spider):
         self.logger.debug(f"Init skip domains: {self.skip_paths}")
         self.allowed_top_level_domains = allowed_top_level_domains
         self.logger.debug(f"Init allowed_top_level_domains: {self.allowed_top_level_domains}")
-        self.target_keywords = target_keywords
-        self.logger.debug(f"Init target keywords: {self.target_keywords}")
+        self.target_netloc_keywords = target_netloc_keywords
+        self.logger.debug(f"Init target netloc keywords: {self.target_netloc_keywords}")
+        self.target_path_keywords = target_path_keywords
+        self.logger.debug(f"Init target paths keywords: {self.target_path_keywords}")
         self.batch_size = batch_size
         self.logger.debug(f"Init batch_size: {self.batch_size}")
         self.allowed_languages = allowed_languages
@@ -120,6 +124,7 @@ class HesitantSpider(scrapy.Spider):
                 meta={
                     "base_url": start_url,
                     "current_start": start_url,
+                    "steps_from_target": 0,
                     "depth": 0,
                     "jumps": 0
                 }
@@ -134,6 +139,7 @@ class HesitantSpider(scrapy.Spider):
                     meta={
                         "base_url": start_url,
                         "current_start": start_url,
+                        "steps_from_target": 0,
                         "depth": 0,
                         "jumps": 0
                     }
@@ -169,18 +175,31 @@ class HesitantSpider(scrapy.Spider):
 
     # Determine whether or not URL is a target
     def url_is_target(self, url: str) -> bool:
-        parsed_url = urlparse(url).path
-        for keyword in self.target_keywords:
-            first_keyword_hit = re.search(keyword, parsed_url)
+        parsed_url = urlparse(url)
+        # Check netloc
+        url_netloc = parsed_url.netloc
+        for keyword in self.target_netloc_keywords:
+            first_keyword_hit = re.search(keyword, url_netloc)
             if first_keyword_hit is not None:
                 self.logger.debug(f"For {url} keyword hit: {first_keyword_hit.group(0)}")
-                return True, first_keyword_hit.group(0)
+                return True, keyword
+
+        # Check path
+        url_path = parsed_url.path
+        for keyword in self.target_path_keywords:
+            first_keyword_hit = re.search(keyword, url_path)
+            if first_keyword_hit is not None:
+                self.logger.debug(f"For {url} keyword hit: {first_keyword_hit.group(0)}")
+                return True, keyword
 
         return False, None
 
     # Determine whether or not to skip URL
     def skip_this_url(self, url: str) -> bool:
         """Function to see if we skip url"""
+
+        if url in self.visited:
+            return True
 
         # Only visit valid urls
         if not validators.url(url):
@@ -248,12 +267,13 @@ class HesitantSpider(scrapy.Spider):
             self.logger.debug(f"Hit timeout {self.timeout} seconds for spider with start urls: {self.start_urls}!")
             raise CloseSpider('bandwidth_exceeded')
         current_depth = response.meta.get("depth", 0)
+        steps_from_target = response.meta.get("steps_from_target", 0)
 
-        # Check if url is tagret
+        # Check if url is target
         url_is_targeted, first_keyword_hit = self.url_is_target(response.url)
 
         # If url is not target and exceeds hesitancy depth, return
-        if not url_is_targeted and current_depth >= self.max_depth:
+        if not url_is_targeted and steps_from_target >= self.max_depth:
             return
 
         # Determine whether we need to add a jump
@@ -310,7 +330,7 @@ class HesitantSpider(scrapy.Spider):
                 self.save_batch()
 
             # Reset current depth because we found target at current page
-            current_depth = 0
+            steps_from_target = 0
 
         # Extract and follow links
         for link in response.css("a::attr(href)").getall():
@@ -327,6 +347,7 @@ class HesitantSpider(scrapy.Spider):
                     "base_url": response.meta.get("base_url"),
                     "current_start": f"{parsed_url.scheme}://{parsed_url.netloc}",
                     "depth": current_depth + 1,
+                    "steps_from_target": steps_from_target + 1,
                     "jumps": jumps
                 },
                 dont_filter=False  # Skip duplicates
@@ -338,6 +359,7 @@ class HesitantSpider(scrapy.Spider):
         urls = response.xpath('//ns:url/ns:loc/text()', namespaces=ns).getall()
 
         for url in urls:
+            url = normalize_url(url)
             # Only continue with valid crawl paths
             if self.skip_this_url(url):
                 continue
