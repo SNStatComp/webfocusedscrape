@@ -1,1 +1,1 @@
-from parse.HTML import IHTMLParser, HTMLBodyParser, EmptystringParser
+from .HTML import IHTMLParser, HTMLBodyParser, EmptystringParser

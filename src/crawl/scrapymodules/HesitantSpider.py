@@ -11,9 +11,9 @@ from scrapy.exceptions import CloseSpider
 from typing import List
 from urllib.parse import urljoin, urlparse
 
-from parse import HTMLBodyParser
-from util import normalize_url
-from .ScrapyResult import ScrapyResult
+from src.parse import HTMLBodyParser
+from src.util import normalize_url
+from src.crawl.scrapymodules import ScrapyResult
 
 
 class HesitantSpider(scrapy.Spider):
@@ -385,7 +385,7 @@ if __name__ == "__main__":
     import os
     from datetime import datetime
     from scrapy.crawler import CrawlerProcess
-    from util import setup
+    from src.util import setup
 
     CONFIG = setup("config/config.yaml")
 
