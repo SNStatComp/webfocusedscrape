@@ -11,8 +11,8 @@ import pandas as pd
 from datetime import datetime
 from scrapy.crawler import CrawlerProcess
 
-from crawl.scrapymodules import HesitantSpider
-from util import setup, normalize_url
+from src.crawl.scrapymodules import HesitantSpider
+from src.util import setup, normalize_url
 
 CONFIG = setup("config/config.yaml")
 
