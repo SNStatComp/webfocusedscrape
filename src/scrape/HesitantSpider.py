@@ -13,7 +13,7 @@ from urllib.parse import urljoin, urlparse
 
 from src.parse import HTMLBodyParser
 from src.util import normalize_url
-from src.crawl.scrapymodules import ScrapyResult
+from . import ScrapyResult
 
 
 class HesitantSpider(scrapy.Spider):
@@ -402,7 +402,7 @@ if __name__ == "__main__":
             "ROBOTSTXT_OBEY": True,
             "LOG_FILE": logfile,
             "DOWNLOADER_MIDDLEWARES": {
-                "src.crawl.scrapymodules.ScrapyCrawlMiddleware.TextTypeFilterMiddleware": 543  # High priority
+                "src.scrape.ScrapyCrawlMiddleware.TextTypeFilterMiddleware": 543  # High priority
             },
             "DOWNLOAD_CONTENT_TYPES": ["text/html", "application/xhtml+xml"]  # TODO can be removed?
         }
