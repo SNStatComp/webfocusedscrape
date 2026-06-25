@@ -11,7 +11,7 @@ from scrapy.exceptions import CloseSpider
 from typing import List
 from urllib.parse import urljoin, urlparse
 
-from src.parse import HTMLBodyParser
+from src.parse import HTMLBodyParser, SchemaParser
 from src.util import normalize_url
 from . import ScrapyResult
 
@@ -71,8 +71,6 @@ class HesitantSpider(scrapy.Spider):
         self.logger.debug(f"Init allowed languages: {self.allowed_languages}")
         self.allowed_countries = allowed_countries
         self.logger.debug(f"Init allowed countries: {self.allowed_countries}")
-        self.schema_keywords = schema_keywords
-        self.logger.debug(f"Init schema keywords: {self.schema_keywords}")
         self.max_jumps = max_jumps
         self.logger.debug(f"Init max_jumps: {self.max_jumps}")
         self.output_file = output_file
@@ -104,6 +102,10 @@ class HesitantSpider(scrapy.Spider):
             ".rss?download=true", ".zip?download=true", ".rar?download=true", ".msu?download=true", ".flv?download=true",
             ".dmg?download=true")
         self.logger.debug(f"URLs will be excluded if they contain any in path:{', '.join(self._unsupported)}")
+
+        # Set schema parser
+        self._schemaparser = SchemaParser(schema_keywords=schema_keywords)
+        self.logger.debug(f"Init schemaparser with keywords: {schema_keywords}")
 
         # Init batch, results, visited 
         self.batch = []
@@ -298,19 +300,7 @@ class HesitantSpider(scrapy.Spider):
         # Process the current page
         if url_is_targeted:
             # Determine schema.org indicator
-            schema_indicator = False
-
-            # Get JSON-LD elements
-            jsonlds = response.xpath("//script[@type='application/ld+json']/text()").getall()
-            if jsonlds:
-                for jsonld in jsonlds:
-                    try:
-                        data = json.loads(jsonld)
-                        if "@type" in data.keys() and data["@type"] in self.schema_keywords:
-                            self.logger.debug(f"Found schema entity {data["@type"]} that is within schema keywords: {self.schema_keywords}")
-                            schema_indicator = True
-                    except json.JSONDecodeError:
-                        pass
+            schema_indicator = True if self._schemaparser.parse(response=response) else False
 
             # Add result to batch
             result = ScrapyResult(
