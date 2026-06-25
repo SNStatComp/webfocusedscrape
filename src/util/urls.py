@@ -2,9 +2,13 @@ from urllib.parse import urlparse, urlunparse
 import re
 
 
-# Normalize URL to make sure crawler can handle it without issue
-def normalize_url(url):
-    # Handle case where there is no scheme at all 
+def normalize_url(url: str):
+    """
+    Normalize URL to make sure crawler can handle it without issue
+    :param url: url to normalize
+    """
+
+    # Handle case where there is no scheme at all
     if not re.match(r'^[a-zA-Z]+://', url):
         url = 'https://' + url
 
