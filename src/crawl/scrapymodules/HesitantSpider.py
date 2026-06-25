@@ -412,13 +412,17 @@ if __name__ == "__main__":
     spiderCrawler = process.create_crawler(HesitantSpider)
 
     # Crawl and configure spider
-    # urls = ['https://books.toscrape.com/']
-    # target_keywords = ["philosophy"]
-
-    urls = ['https://werkenbijhetcbs.nl/']
-    target_keywords = ["enqueteur"]
+    urls = ['https://books.toscrape.com/']
+    target_keywords = ["philosophy"]
     sitemaps_tocheck = ["sitemap.xml"]
     allowed_top_level_domains = [".com", ".nl"]
+    max_depth = 1
+
+    # urls = ['https://werkenbijhetcbs.nl/']
+    # target_keywords = ["enqueteur"]
+    # sitemaps_tocheck = ["sitemap.xml"]
+    # allowed_top_level_domains = [".com", ".nl"]
+    # max_depth = 2
 
     # Skip domains
     file_skip_domains = f"{CONFIG.input.input_dir}/{CONFIG.input.input_files.skip_domains}"
@@ -433,7 +437,9 @@ if __name__ == "__main__":
     process.crawl(
         spiderCrawler,
         start_urls=urls,
-        target_keywords=target_keywords,
+        target_netloc_keywords=target_keywords,
+        target_path_keywords=target_keywords,
+        max_depth=max_depth,
         skip_domains=skip_domains,
         allowed_top_level_domains=allowed_top_level_domains,
         output_file=output_file,
