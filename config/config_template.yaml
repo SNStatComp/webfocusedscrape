@@ -12,16 +12,17 @@ requests:
   timeout_read: 7 # In seconds 
   max_retries: 3
 input:
-  input_dir: ../input
+  input_dir: input
   input_files:
     skip_domains: skipdomains.txt
     urls: urls.txt
-    keywords: keywords.txt
+    netloc_keywords: keywords.txt
+    path_keywords: keywords.txt
   url_max: 100
   url_offset: 0
   input_variables:
 output:
-  output_dir: ../output
+  output_dir: output
   batchsize: 100
   logs: logs
 crawl:
