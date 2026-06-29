@@ -12,8 +12,9 @@ from typing import List
 from urllib.parse import urljoin, urlparse
 
 from src.parse import HTMLBodyParser, SchemaParser
+from src.fetch import PlaywrightTextFetcher 
+from src.scrape import ScrapyResult
 from src.util import normalize_url
-from . import ScrapyResult
 
 
 class HesitantSpider(scrapy.Spider):
@@ -23,10 +24,13 @@ class HesitantSpider(scrapy.Spider):
     custom_settings = {
         "USER_AGENT": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36",
         "AUTOTHROTTLE_ENABLED": True,  # Auto throttle to maximize speed without risking blocks
-        "AUTOTHROTTLE_START_DELAY": 1.0,  # Start slow to "warm up"
-        "AUTOTHROTTLE_MAX_DELAY": 30.0,   # Never wait more than 10s
+        "AUTOTHROTTLE_START_DELAY": 5.0,  # Start slow to "warm up"
+        "AUTOTHROTTLE_MAX_DELAY": 10.0,   # Never wait more than 10s
         "AUTOTHROTTLE_TARGET_CONCURRENCY": 1.0,  # Aim for 1 request per worker at a time
+        "CONCURRENT_REQUESTS": 4,# Allow more concurrent requests within the single process
         "DOWNLOAD_DELAY": 0,               # Let Autothrottle handle the delay
+        "DOWNLOAD_TIMEOUT": 5,            # CRITICAL: Fail fast (5s) if the site is dead
+        "RETRY_TIMES": 1,   
     }
 
     def __init__(
@@ -86,6 +90,7 @@ class HesitantSpider(scrapy.Spider):
 
         # Set parser and unsupported endpoints
         self._htmlparser = HTMLBodyParser()
+        self._fetcher = PlaywrightTextFetcher()
         self._unsupported = (
             ".ics", ".mng", ".pct", ".bmp", ".gif", ".jpg", ".jpeg", ".png", ".pst", ".psp", ".tif", ".tiff", ".drw", ".dxf", ".eps",
             ".woff2", ".svg", ".mp3", ".wma", ".ogg", ".wav", ".ra", ".aac", ".mid", ".aiff", ".3gp", ".asf", ".asx", ".avi", ".mp4",
@@ -111,6 +116,7 @@ class HesitantSpider(scrapy.Spider):
         self.batch = []
         self.results = []
         self.visited = set()
+        self.sitemaps_crawled = set()
 
         if max_depth < 0:
             self.logger.debug("Only urls from starting_url can be found, max_depth < 0")
@@ -133,6 +139,7 @@ class HesitantSpider(scrapy.Spider):
             )
             # next, if desired, check the sitemapurls to augment existing results
             parsed_url = urlparse(start_url)
+            self.sitemaps_crawled.add(parsed_url.netloc)
             for sitemap in self.sitemaps_tocheck:
                 url = f"{parsed_url.scheme}://{parsed_url.netloc}/{sitemap}"
                 yield scrapy.Request(
@@ -262,7 +269,7 @@ class HesitantSpider(scrapy.Spider):
         return False
 
     # Process request response
-    def parse(self, response):
+    async def parse(self, response):
         # Check if we passed timeout
         if time.time() - self.start_time > self.timeout:
             print(f"Hit timeout {self.timeout} seconds for spider with start urls: {self.start_urls}!")
@@ -297,30 +304,27 @@ class HesitantSpider(scrapy.Spider):
         self.logger.debug(f"Parsing url: {response.url}, targeted: {url_is_targeted}, depth: {current_depth}, jumps: {jumps}")
         self.visited.add(response.url)
 
-        # Process the current page
-        if url_is_targeted:
-            # Determine schema.org indicator
-            schema_indicator = True if self._schemaparser.parse(response=response) else False
+        # Add sitemap discovery
+        if parsed_url.netloc.lower() not in self.sitemaps_crawled:
+            self.sitemaps_crawled.add(parsed_url.netloc.lower())
+            self.logger.debug(f"New domain detected: {parsed_url.netloc.lower()}. Checking for sitemaps...")
 
-            # Add result to batch
-            result = ScrapyResult(
-                    base_url=str(response.meta.get("base_url")),
-                    url=response.url,
-                    status=response.status,
-                    first_keyword_hit=first_keyword_hit,
-                    content=self._htmlparser.parse(html=response.text),
-                    crawl_depth=current_depth,
-                    schema_indicator=schema_indicator
+            for sitemap_path in self.sitemaps_tocheck:
+                # Construct the sitemap URL
+                sitemap_url = urljoin(f"{parsed_url.scheme}://{parsed_url.netloc}/", sitemap_path)
+
+                # YIELD the request so Scrapy handles it
+                yield scrapy.Request(
+                    url=sitemap_url,
+                    callback=self.parse_sitemap,
+                    meta={
+                        "base_url": response.meta.get("base_url"),
+                        "current_start": f"{parsed_url.scheme}://{parsed_url.netloc}",
+                        "depth": current_depth,
+                        "steps_from_target": steps_from_target,
+                        "jumps": jumps
+                    }
                 )
-
-            self.batch.append(result)
-
-            # Save batch if exceeding batch size
-            if len(self.batch) >= self.batch_size:
-                self.save_batch()
-
-            # Reset current depth because we found target at current page
-            steps_from_target = 0
 
         # Extract and follow links
         for link in response.css("a::attr(href)").getall():
@@ -342,20 +346,62 @@ class HesitantSpider(scrapy.Spider):
                 },
                 dont_filter=False  # Skip duplicates
             )
+
+        # Process the current page
+        if url_is_targeted:
+            self.logger.debug(f"Found targeted url: {response.url} from base url {response.meta.get("base_url")}")
+            # Determine schema.org indicator
+            schema_indicator = True if self._schemaparser.parse(response=response) else False
+
+            # Add result to batch
+            result = ScrapyResult(
+                    base_url=str(response.meta.get("base_url")),
+                    url=response.url,
+                    status=response.status,
+                    first_keyword_hit=first_keyword_hit,
+                    content= await self._fetcher.fetch(response.url),
+                    crawl_depth=current_depth,
+                    schema_indicator=schema_indicator
+                )
+
+            self.batch.append(result)
+
+            # Save batch if exceeding batch size
+            if len(self.batch) >= self.batch_size:
+                self.save_batch()
+
+            # Reset current depth because we found target at current page
+            steps_from_target = 0
     
     def parse_sitemap(self, response):
         # Extract all URLs from the sitemap, accounting for namespace
         ns = {'ns': 'http://www.sitemaps.org/schemas/sitemap/0.9'}
-        urls = response.xpath('//ns:url/ns:loc/text()', namespaces=ns).getall()
+
+        # Look for both <url><loc> (standard) and <sitemap><loc> (index)
+        urls = response.xpath('//ns:url/ns:loc/text() | //ns:sitemap/ns:loc/text()', namespaces=ns).getall()
 
         for url in urls:
             url = normalize_url(url)
             # Only continue with valid crawl paths
             if self.skip_this_url(url):
                 continue
-            
             parsed_url = urlparse(url)
-            yield scrapy.Request(
+
+            # Check if the discovered URL is itself a sitemap (to allow recursive discovery)
+            # If it ends in .xml, we should probably call parse_sitemap again
+            if url.endswith('.xml'):
+                yield scrapy.Request(
+                    url=url,
+                    callback=self.parse_sitemap,
+                    meta={
+                        "base_url":  response.meta.get("base_url"),
+                        "current_start": f"{parsed_url.scheme}://{parsed_url.netloc}",
+                        "depth": response.meta.get("depth", 0) + 1
+                    }
+                )
+            else:
+                # Otherwise, it's a regular page
+                yield scrapy.Request(
                     url=url,
                     callback=self.parse,
                     meta={
@@ -366,8 +412,9 @@ class HesitantSpider(scrapy.Spider):
                 )
 
     # Called when the spider closes cleanly
-    def closed(self, reason):
+    async def closed(self, reason):
         self.save_batch()
+        await self._fetcher.close()
         print(f"Spider closed because of: {reason}. Total collected pages: {len(self.results)}")
 
 
