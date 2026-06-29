@@ -215,3 +215,7 @@ config/config.yaml
 # input and output files need to be explicitly added
 input
 output
+
+# (Debug) Output file types
+*.txt
+*.html
