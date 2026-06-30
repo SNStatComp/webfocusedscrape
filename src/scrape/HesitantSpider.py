@@ -12,8 +12,8 @@ from typing import List
 from urllib.parse import urljoin, urlparse
 
 from src.parse import HTMLBodyParser, SchemaParser
-from src.fetch import PlaywrightTextFetcher 
-from src.scrape import ScrapyResult
+from src.fetch import PlaywrightTextFetcher
+from src.scrape.ScrapyResult import ScrapyResult
 from src.util import normalize_url
 
 
@@ -352,6 +352,7 @@ class HesitantSpider(scrapy.Spider):
             self.logger.debug(f"Found targeted url: {response.url} from base url {response.meta.get("base_url")}")
             # Determine schema.org indicator
             schema_indicator = True if self._schemaparser.parse(response=response) else False
+            self.logger.debug(f"Schema indicator: {schema_indicator}")
 
             # Add result to batch
             result = ScrapyResult(
@@ -359,7 +360,7 @@ class HesitantSpider(scrapy.Spider):
                     url=response.url,
                     status=response.status,
                     first_keyword_hit=first_keyword_hit,
-                    content= await self._fetcher.fetch(response.url),
+                    content=await self._fetcher.fetch(response.url),
                     crawl_depth=current_depth,
                     schema_indicator=schema_indicator
                 )
