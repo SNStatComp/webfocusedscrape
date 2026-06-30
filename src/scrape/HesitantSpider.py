@@ -301,7 +301,7 @@ class HesitantSpider(scrapy.Spider):
             return
 
         # Process response if above skip-conditions not met
-        self.logger.debug(f"Parsing url: {response.url}, targeted: {url_is_targeted}, depth: {current_depth}, jumps: {jumps}")
+        self.logger.debug(f"Parsing url: {response.url}, targeted: {url_is_targeted}, depth: {current_depth}, steps from target: {steps_from_target}, jumps: {jumps}")
         self.visited.add(response.url)
 
         # Add sitemap discovery
