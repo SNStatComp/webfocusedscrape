@@ -120,7 +120,7 @@ if __name__ == "__main__":
 
     # Set logging level and create file
     # All workers write to same log
-    logging_level = logging.DEBUG
+    logging_level = logging.INFO
 
     dir_log = f"{CONFIG.output.output_dir}/{CONFIG.output.logs}"
     if not os.path.exists(dir_log):
@@ -162,6 +162,7 @@ if __name__ == "__main__":
     # Set amount of parallel workers and prepare chunk-wisem parallel execution
     max_workers = 16
     num_workers = min([len(urls), max_workers])
+    logging.info(f"Will use {num_workers} workers!")
     batch_size = len(urls) // num_workers if len(urls) > num_workers else 1
     url_chunks = np.array_split(urls, num_workers)
 
