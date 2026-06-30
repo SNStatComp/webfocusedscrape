@@ -40,7 +40,6 @@ def read_parquet_dir(parquet_dir):
 # Spawn spider crawler process
 def spawn_spider_process(urls, netloc_keywords, path_keywords, skip_domains, process_id, log_level, logfile, output_file, schema_keywords):
     print(f"Args: urls: {urls}, netloc keywords: {netloc_keywords}, path keywords: {path_keywords}, skip domains: {skip_domains}, log level: {log_level}, log file: {logfile}, output file: {output_file}, process_id: {process_id}")
-    print(f"Starting crawling process (PID: {process_id}, OSPID: {os.getpid()}) for {urls}!")
     project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
     if project_root not in sys.path:
         sys.path.insert(0, project_root)
@@ -53,7 +52,8 @@ def spawn_spider_process(urls, netloc_keywords, path_keywords, skip_domains, pro
             "DOWNLOADER_MIDDLEWARES": {
                 "src.scrape.ScrapyCrawlMiddleware.TextTypeFilterMiddleware": 543  # High priority
             },
-            "DOWNLOAD_CONTENT_TYPES": ["text/html", "application/xhtml+xml"]  # TODO can be removed?
+            "DOWNLOAD_CONTENT_TYPES": ["text/html", "application/xhtml+xml"],
+            "TWISTED_REACTOR": "twisted.internet.asyncioreactor.AsyncioSelectorReactor",
         }
     )
 
@@ -106,6 +106,7 @@ def spawn_spider_process(urls, netloc_keywords, path_keywords, skip_domains, pro
         return []
 
     try:
+        print(f"Starting crawling process (PID: {process_id}, OSPID: {os.getpid()}) for {urls}!")
         process.start()
     except Exception as e:
         print(f"Something went from starting process! Error {e}")
