@@ -48,7 +48,6 @@ def spawn_spider_process(urls, netloc_keywords, path_keywords, skip_domains, pro
     process = CrawlerProcess(
         settings={
             "ROBOTSTXT_OBEY": True,
-            "LOG_FILE": logfile,
             "DOWNLOADER_MIDDLEWARES": {
                 "src.scrape.ScrapyCrawlMiddleware.TextTypeFilterMiddleware": 543  # High priority
             },
@@ -65,6 +64,11 @@ def spawn_spider_process(urls, netloc_keywords, path_keywords, skip_domains, pro
     fileHandler = logging.FileHandler(logfile)
     fileHandler.setLevel(log_level)
     root_logger.addHandler(fileHandler)
+
+    # Explicitly set levels for Scrapy and other noisy loggers
+    logging.getLogger('scrapy').setLevel(log_level)
+    logging.getLogger('twisted').setLevel(log_level)
+    root_logger.setLevel(log_level)
 
     # Remove console output
     # Get the logger that Scrapy uses and remove all handlers that print to the console
@@ -87,7 +91,7 @@ def spawn_spider_process(urls, netloc_keywords, path_keywords, skip_domains, pro
         target_path_keywords=path_keywords,
         skip_domains=skip_domains,
         output_file=output_file,
-        allowed_top_level_domains=[".com", ".nl", ".ai", ".de", ".be", ".eu", ".io"],
+        allowed_top_level_domains=[".com", ".nl", ".ai", ".de", ".be", ".eu", ".io", ".org"],
         skip_paths=[
             "shop", "cart", "clients", "testimonials", "search",
             "query", "calendar", "events", "archive", "news",
@@ -98,7 +102,8 @@ def spawn_spider_process(urls, netloc_keywords, path_keywords, skip_domains, pro
         ],
         allowed_languages=["nl", "en", "en-uk", "en-gb"],
         allowed_countries=["nl"],
-        schema_keywords=schema_keywords
+        schema_keywords=schema_keywords,
+        timeout=36000
     )
 
     # If worker gets 0 urls, pass (shouldn't happen)
@@ -120,7 +125,7 @@ if __name__ == "__main__":
 
     # Set logging level and create file
     # All workers write to same log
-    logging_level = logging.INFO
+    logging_level = logging.DEBUG
 
     dir_log = f"{CONFIG.output.output_dir}/{CONFIG.output.logs}"
     if not os.path.exists(dir_log):
@@ -160,7 +165,7 @@ if __name__ == "__main__":
         skip_domains = [line.rstrip() for line in file_in]
 
     # Set amount of parallel workers and prepare chunk-wisem parallel execution
-    max_workers = 16
+    max_workers = 32
     num_workers = min([len(urls), max_workers])
     logging.info(f"Will use {num_workers} workers!")
     batch_size = len(urls) // num_workers if len(urls) > num_workers else 1
@@ -183,7 +188,7 @@ if __name__ == "__main__":
                 i,
                 logging_level,
                 logfile,
-                f"{CONFIG.output.output_dir}/{time_part}/worker_{i}.parquet",  # Different output files per werker
+                f"{CONFIG.output.output_dir}/{time_part}/worker_{i}.parquet",  # Different output files per worker
                 [CONFIG.crawl.schema.keyword]
             )
         )

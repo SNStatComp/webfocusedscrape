@@ -352,7 +352,6 @@ class HesitantSpider(scrapy.Spider):
             self.logger.debug(f"Found targeted url: {response.url} from base url {response.meta.get("base_url")}")
             # Determine schema.org indicator
             schema_indicator = True if self._schemaparser.parse(response=response) else False
-            self.logger.debug(f"Schema indicator: {schema_indicator}")
 
             # Add result to batch
             result = ScrapyResult(

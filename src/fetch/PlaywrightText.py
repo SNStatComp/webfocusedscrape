@@ -82,7 +82,7 @@ class PlaywrightTextFetcher:
                 # We don't need to pass context here, the next retry will create its own
                 return await self._fetch_with_retries(url, retries + 1)
 
-            return {}
+            return ""
         finally:
             # ALWAYS close the context and page to free up memory, 
             # even if the request fails or succeeds.
