@@ -8,6 +8,8 @@ More info on statistical scraping [here](https://github.com/SNStatComp/SSIG)
 # Getting started
 - Install all required packages using 
     > pip install -r requirements.txt
+    > playwright install
+    > playwright install-deps
 - Activate the environment
 - run the following command to install modules in src as packages for proper import
     > pip install -e .
