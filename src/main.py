@@ -51,7 +51,7 @@ def spawn_spider_process(urls, netloc_keywords, path_keywords, skip_domains, pro
             "ROBOTSTXT_OBEY": True,
             "LOG_FILE": logfile,
             "DOWNLOADER_MIDDLEWARES": {
-                "src.crawl.scrapymodules.ScrapyCrawlMiddleware.TextTypeFilterMiddleware": 543  # High priority
+                "src.scrape.ScrapyCrawlMiddleware.TextTypeFilterMiddleware": 543  # High priority
             },
             "DOWNLOAD_CONTENT_TYPES": ["text/html", "application/xhtml+xml"]  # TODO can be removed?
         }
