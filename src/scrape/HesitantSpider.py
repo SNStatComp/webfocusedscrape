@@ -4,6 +4,7 @@ import scrapy
 import time
 import validators
 import logging
+from datetime import datetime
 
 import pandas as pd
 
@@ -163,10 +164,11 @@ class HesitantSpider(scrapy.Spider):
         df = pd.DataFrame({
             "base_url": [res.base_url for res in self.batch],
             "url": [res.url for res in self.batch],
+            "timestamp": [res.timestamp for res in self.batch],
             "first_keyword_hit": [res.first_keyword_hit for res in self.batch],
             "content": [res.content for res in self.batch],
             "crawl_depth": [res.crawl_depth for res in self.batch],
-            "schema_indicator": [res.schema_indicator for res in self.batch]
+            "schema_indicator": [res.schema_indicator for res in self.batch],
         })
 
         df.to_parquet(
@@ -361,7 +363,8 @@ class HesitantSpider(scrapy.Spider):
                     first_keyword_hit=first_keyword_hit,
                     content=await self._fetcher.fetch(response.url),
                     crawl_depth=current_depth,
-                    schema_indicator=schema_indicator
+                    schema_indicator=schema_indicator,
+                    timestamp=datetime.now().strftime("%Y-%m-%d-%H:%M:%S")
                 )
 
             self.batch.append(result)
