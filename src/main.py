@@ -51,6 +51,8 @@ def spawn_spider_process(urls, netloc_keywords, path_keywords, skip_domains, pro
             "DOWNLOADER_MIDDLEWARES": {
                 "src.scrape.ScrapyCrawlMiddleware.TextTypeFilterMiddleware": 543  # High priority
             },
+            "LOG_FILE": logfile,
+            "LOG_LEVEL": log_level,
             "DOWNLOAD_CONTENT_TYPES": ["text/html", "application/xhtml+xml"],
             "TWISTED_REACTOR": "twisted.internet.asyncioreactor.AsyncioSelectorReactor",
         }
@@ -61,8 +63,22 @@ def spawn_spider_process(urls, netloc_keywords, path_keywords, skip_domains, pro
     root_logger.setLevel(log_level)
     root_logger.handlers = []
 
+    # Define a filter to inject process_id into every LogRecord
+    class ProcessIdFilter(logging.Filter):
+        def filter(self, record):
+            record.process_id = process_id
+            return True
+
     fileHandler = logging.FileHandler(logfile)
     fileHandler.setLevel(log_level)
+
+    # Add the filter to the handler
+    fileHandler.addFilter(ProcessIdFilter())
+
+
+    # This format mimics Scrapy's default look
+    formatter = logging.Formatter('%(asctime)s %(levelname)s: %(name)s: worker_id: %(process_id)s: %(message)s', datefmt='%Y-%m-%d %H:%M:%S')
+    fileHandler.setFormatter(formatter)
     root_logger.addHandler(fileHandler)
 
     # Explicitly set levels for Scrapy and other noisy loggers
@@ -71,13 +87,16 @@ def spawn_spider_process(urls, netloc_keywords, path_keywords, skip_domains, pro
     root_logger.setLevel(log_level)
 
     # Remove console output
-    # Get the logger that Scrapy uses and remove all handlers that print to the console
-    scrapy_logger = logging.getLogger('scrapy')
-    for handler in scrapy_logger.handlers[:]:
-        scrapy_logger.removeHandler(handler)
-
-    # Silence the twisted engine too
-    logging.getLogger('twisted').handlers = []
+    for logger_name in ['scrapy', 'twisted', 'sqlalchemy.engine']:
+        logger = logging.getLogger(logger_name)
+        logger.setLevel(log_level)
+        # Remove any handlers that might be printing to console
+        for handler in logger.handlers[:]:
+            logger.removeHandler(handler)
+        # Prevent logs from propagating up to the root logger's console handlers
+        logger.propagate = True
+        # Silence the twisted engine too
+        logging.getLogger('twisted').handlers = []
 
     # Create crawler from process
     spiderCrawler = process.create_crawler(HesitantSpider)
