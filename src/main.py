@@ -91,19 +91,19 @@ def spawn_spider_process(urls, netloc_keywords, path_keywords, skip_domains, pro
         target_path_keywords=path_keywords,
         skip_domains=skip_domains,
         output_file=output_file,
-        allowed_top_level_domains=[".com", ".nl", ".ai", ".de", ".be", ".eu", ".io", ".org"],
+        allowed_top_level_domains=[".com", ".nl", ".ai", ".de", ".be", ".fr", ".eu", ".io", ".org"],
         skip_paths=[
             "shop", "cart", "clients", "testimonials", "search",
             "query", "calendar", "events", "archive", "news",
             "blog", "media", "articles", "profile", "legal",
             "tos", "products", "winkel", "winkelwagen", "archief",
-            "nieuws", "artikelen", "producten", "faq", "policies",
+            "nieuws", "artikelen", "artikel", "producten", "faq", "policies",
             "downloads", "portfolio"
         ],
-        allowed_languages=["nl", "en", "en-uk", "en-gb"],
+        allowed_languages=["nl", "en", "en-uk", "en-gb", "nl-nl", "en-nl", "nl-en"],
         allowed_countries=["nl"],
         schema_keywords=schema_keywords,
-        timeout=36000
+        timeout=3600 * 48  # 2 days
     )
 
     # If worker gets 0 urls, pass (shouldn't happen)
@@ -125,7 +125,7 @@ if __name__ == "__main__":
 
     # Set logging level and create file
     # All workers write to same log
-    logging_level = logging.DEBUG
+    logging_level = logging.INFO
 
     dir_log = f"{CONFIG.output.output_dir}/{CONFIG.output.logs}"
     if not os.path.exists(dir_log):
@@ -165,7 +165,7 @@ if __name__ == "__main__":
         skip_domains = [line.rstrip() for line in file_in]
 
     # Set amount of parallel workers and prepare chunk-wisem parallel execution
-    max_workers = 32
+    max_workers = 16
     num_workers = min([len(urls), max_workers])
     logging.info(f"Will use {num_workers} workers!")
     batch_size = len(urls) // num_workers if len(urls) > num_workers else 1
