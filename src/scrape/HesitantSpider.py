@@ -130,6 +130,7 @@ class HesitantSpider(scrapy.Spider):
             yield scrapy.Request(
                 url=start_url,
                 callback=self.parse,
+                errback=self.handle_error,
                 meta={
                     "base_url": start_url,
                     "current_start": start_url,
@@ -146,6 +147,7 @@ class HesitantSpider(scrapy.Spider):
                 yield scrapy.Request(
                     url=url,
                     callback=self.parse_sitemap,
+                    errback=self.handle_error,
                     meta={
                         "base_url": start_url,
                         "current_start": start_url,
@@ -319,6 +321,7 @@ class HesitantSpider(scrapy.Spider):
                 yield scrapy.Request(
                     url=sitemap_url,
                     callback=self.parse_sitemap,
+                    errback=self.handle_error,
                     meta={
                         "base_url": response.meta.get("base_url"),
                         "current_start": f"{parsed_url.scheme}://{parsed_url.netloc}",
@@ -339,6 +342,7 @@ class HesitantSpider(scrapy.Spider):
             yield scrapy.Request(
                 url=url,
                 callback=self.parse,
+                errback=self.handle_error,
                 meta={
                     "base_url": response.meta.get("base_url"),
                     "current_start": f"{parsed_url.scheme}://{parsed_url.netloc}",
@@ -396,6 +400,7 @@ class HesitantSpider(scrapy.Spider):
                 yield scrapy.Request(
                     url=url,
                     callback=self.parse_sitemap,
+                    errback=self.handle_error,
                     meta={
                         "base_url":  response.meta.get("base_url"),
                         "current_start": f"{parsed_url.scheme}://{parsed_url.netloc}",
@@ -407,6 +412,7 @@ class HesitantSpider(scrapy.Spider):
                 yield scrapy.Request(
                     url=url,
                     callback=self.parse,
+                    errback=self.handle_error,
                     meta={
                         "base_url":  response.meta.get("base_url"),
                         "current_start": f"{parsed_url.scheme}://{parsed_url.netloc}",
@@ -414,10 +420,15 @@ class HesitantSpider(scrapy.Spider):
                     }
                 )
 
+    def handle_error(self, failure):
+        # TODO pass some specific errors to info?
+        self.logger.debug(f"Error encountered: {failure}")
+
     # Called when the spider closes cleanly
     async def closed(self, reason):
         self.save_batch()
         await self._fetcher.close()
+        self.logger.info(f"Spider closed because of: {reason}. Total collected pages: {len(self.results)}")
         print(f"Spider closed because of: {reason}. Total collected pages: {len(self.results)}")
 
 
