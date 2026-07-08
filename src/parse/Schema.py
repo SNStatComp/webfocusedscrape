@@ -12,7 +12,7 @@ class ISchemaParser(ABC):
     """
 
     @abstractmethod
-    def parse(self, titles: List[str]) -> str:
+    def parse(self, response: Response) -> List[str]:
         raise NotImplementedError("Do not call abstract base class.")
 
 
