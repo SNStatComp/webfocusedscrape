@@ -144,7 +144,7 @@ if __name__ == "__main__":
 
     # Set logging level and create file
     # All workers write to same log
-    logging_level = logging.INFO
+    logging_level = logging.DEBUG
 
     dir_log = f"{CONFIG.output.output_dir}/{CONFIG.output.logs}"
     if not os.path.exists(dir_log):

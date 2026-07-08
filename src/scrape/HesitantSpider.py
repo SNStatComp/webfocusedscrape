@@ -92,21 +92,12 @@ class HesitantSpider(scrapy.Spider):
         # Set parser and unsupported endpoints
         self._htmlparser = HTMLBodyParser()
         self._fetcher = PlaywrightTextFetcher()
-        self._unsupported = (
+        self._unsupported = {
             ".ics", ".mng", ".pct", ".bmp", ".gif", ".jpg", ".jpeg", ".png", ".pst", ".psp", ".tif", ".tiff", ".drw", ".dxf", ".eps",
             ".woff2", ".svg", ".mp3", ".wma", ".ogg", ".wav", ".ra", ".aac", ".mid", ".aiff", ".3gp", ".asf", ".asx", ".avi", ".mp4",
             ".woff", ".mpg", ".qt", ".rm", ".swf", ".wmv", ".m4a", ".css", ".pdf", ".doc", ".docx", ".exe", ".bin", ".rss", ".zip",
-            ".rar", ".msu", ".flv", ".dmg", ".xls", ".xlsx", ".ico", ".mng?download=true", ".pct?download=true", ".bmp?download=true",
-            ".gif?download=true", ".jpg?download=true", ".jpeg?download=true", ".png?download=true", ".pst?download=true",
-            ".psp?download=true", ".tif?download=true", ".tiff?download=true", ".ai?download=true", ".drw?download=true",
-            ".dxf?download=true", ".eps?download=true", ".ps?download=true", ".svg?download=true", ".mp3?download=true",
-            ".wma?download=true", ".ogg?download=true", ".wav?download=true", ".ra?download=true", ".aac?download=true",
-            ".mid?download=true", ".au?download=true", ".aiff?download=true", ".3gp?download=true", ".asf?download=true",
-            ".asx?download=true", ".avi?download=true", ".mov?download=true", ".mp4?download=true", ".mpg?download=true",
-            ".qt?download=true", ".rm?download=true", ".swf?download=true", ".wmv?download=true", ".m4a?download=true",
-            ".css?download=true", ".pdf?download=true", ".doc?download=true", ".exe?download=true", ".bin?download=true",
-            ".rss?download=true", ".zip?download=true", ".rar?download=true", ".msu?download=true", ".flv?download=true",
-            ".dmg?download=true")
+            ".rar", ".msu", ".flv", ".dmg", ".xls", ".xlsx", ".ico"
+        }
         self.logger.debug(f"URLs will be excluded if they contain any in path:{', '.join(self._unsupported)}")
 
         # Set schema parser
@@ -218,14 +209,22 @@ class HesitantSpider(scrapy.Spider):
         if not validators.url(url):
             return True
 
-        # Only visit pages with supported extensions
-        if any(ext in url for ext in self._unsupported):
-            self.logger.debug(f"Skip {url}, because extension is unsupported")
-            return True
-
         # Only visit pages on allowed top-level domains
         parsed_url = urlparse(url)
         url_netloc = parsed_url.netloc.lower()
+
+        # Get the extension from the path (e.g., '.jpg')
+        path_segments = parsed_url.path.split('/')
+        last_segment = path_segments[-1] if path_segments else ""
+
+        if '.' in last_segment:
+            ext = '.' + last_segment.split('.')[-1]
+        else:
+            ext = ""
+
+        if ext in self._unsupported:
+            self.logger.debug(f"Skip {url}, because extension {ext} is unsupported")
+            return True
 
         if not any([url_netloc.endswith(toplevel_domain) for toplevel_domain in self.allowed_top_level_domains]):
             self.logger.debug(f"Skip {url} with netloc {url_netloc}, because top-level domain is not in allowed list")
@@ -243,7 +242,7 @@ class HesitantSpider(scrapy.Spider):
             return True  # skip
 
         # Skip if first path is a country code but not within allowed
-        paths = urlparse(url).path.split("/")
+        paths = parsed_url.path.split("/")
         if len(paths) >= 2:
             if len(paths[1]) == 2 and paths[1] not in self.allowed_countries:
                 self.logger.debug(f"Skip {url} because path /{paths[1]}/ indicates country-page not in allowed countries: {self.allowed_countries}")

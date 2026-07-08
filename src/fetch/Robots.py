@@ -25,8 +25,17 @@ class RobotsFetcher(IFetcher):
     def fetch(self, domain: str) -> RobotFileParser:
         """Fetches robots file for given url domain, if not already done"""
 
-        # only download robots in case it hasn't already
-        self.results.setdefault(domain, RobotFileParser(url=f"https://{domain}/robots.txt"))
+        if domain not in self.results:
+            parser = RobotFileParser()
+            parser.set_url(f"https://{domain}/robots.txt")
+            try:
+                parser.read()  # <--- THIS is the missing step that performs the HTTP GET
+                self.results[domain] = parser
+            except Exception as e:
+                # You might want to return a default parser or handle this error
+                # so the spider doesn't crash.
+                raise e
+
         return self.results[domain]
 
     def get_results(self) -> Dict[str, RobotFileParser]:

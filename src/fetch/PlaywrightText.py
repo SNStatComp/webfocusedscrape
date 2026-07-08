@@ -1,5 +1,4 @@
 import asyncio
-import random
 import logging
 from typing import Tuple, Union
 
@@ -76,9 +75,7 @@ class PlaywrightTextFetcher:
             logging.error(f"Playwright request failed for {url}. Error: {e}")
 
             if retries < self.max_retries:
-                wait_time = random.uniform(1, 5)
-                logging.info(f"Retrying in {wait_time:.2f} seconds...")
-                await asyncio.sleep(wait_time)
+                await asyncio.sleep(self.wait_time)
                 # We don't need to pass context here, the next retry will create its own
                 return await self._fetch_with_retries(url, retries + 1)
 
