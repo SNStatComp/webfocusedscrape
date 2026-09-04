@@ -27,18 +27,54 @@ class SchemaParser(ISchemaParser):
     def parse(self, response: Response) -> List[str]:
         """
         returns the types that were found of the allowed type
+        Handles @graph, lists, and @type being list or string.
         """
+        if not self.schema_keywords:
+            return []
+        # normalize keywords to set for O1
+        kw_set = set(self.schema_keywords)
         results = []
         jsonlds = response.xpath("//script[@type='application/ld+json']/text()").getall()
-        if jsonlds:
-            for jsonld in jsonlds:
-                try:
-                    data = json.loads(jsonld)
-                    if "@type" in data.keys() and data["@type"] in self.schema_keywords:
-                        logging.debug(f"Found schema entity {data["@type"]} that is within schema keywords: {self.schema_keywords}")
-                        results.append(data["@type"])
-                except json.JSONDecodeError:
-                    pass
+        if not jsonlds:
+            return results
+        for jsonld in jsonlds:
+            if not jsonld or not jsonld.strip():
+                continue
+            try:
+                data = json.loads(jsonld)
+            except (json.JSONDecodeError, ValueError):
+                continue
+
+            # normalize to iterable of objects
+            candidates = []
+            if isinstance(data, list):
+                candidates = data
+            elif isinstance(data, dict):
+                if "@graph" in data and isinstance(data["@graph"], list):
+                    candidates = data["@graph"]
+                    # also check top-level type itself
+                    if "@type" in data:
+                        candidates = candidates + [data]
+                else:
+                    candidates = [data]
+            else:
+                continue
+
+            for obj in candidates:
+                if not isinstance(obj, dict):
+                    continue
+                t = obj.get("@type")
+                if t is None:
+                    continue
+                # @type can be str or list
+                types = [t] if isinstance(t, str) else (t if isinstance(t, list) else [])
+                for typ in types:
+                    if typ in kw_set:
+                        logging.debug(f"Found schema entity {typ} that is within schema keywords: {self.schema_keywords}")
+                        results.append(typ)
+                    # also handle case where typ is e.g. "https://schema.org/JobPosting"
+                    elif isinstance(typ, str) and typ.rsplit("/", 1)[-1] in kw_set:
+                        results.append(typ)
         return results
 
 

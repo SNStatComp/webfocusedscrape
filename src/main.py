@@ -9,6 +9,7 @@ import numpy as np
 import pandas as pd
 
 from datetime import datetime
+from urllib.parse import urlparse
 from scrapy.crawler import CrawlerProcess
 
 from src.scrape import HesitantSpider
@@ -17,14 +18,17 @@ from src.util import setup, normalize_url
 CONFIG = setup("config/config.yaml")
 
 
-# Check if string is valid and contains no strange characters
+# Pre-compiled for hot path (100k rows)
+_STRANGE_RE = re.compile(r'[\x00-\x08\x0B\x0E-\x1F\x7F]')
+
 def is_valid_string(s):
     if not isinstance(s, str):
         return False
-    if len(s) == 0:
+    if not s:
         return False
-    strange_chars = re.findall(r'[\x00-\x08\x0B\x0E-\x1F\x7F]', str(s))
-    return not (len(strange_chars) / len(s)) > 0.1
+    # count strange chars without building full list
+    cnt = len(_STRANGE_RE.findall(s))
+    return not (cnt / len(s)) > 0.1
 
 
 # Concatenates all .parquet files in a dir (and its subdirs)
@@ -33,34 +37,76 @@ def read_parquet_dir(parquet_dir):
         for file in files:
             if file.endswith('.parquet'):
                 file_path = os.path.join(root, file)
-                df = pd.read_parquet(file_path)
-                yield df[df['content'].apply(is_valid_string)]
+                try:
+                    df = pd.read_parquet(file_path)
+                except Exception:
+                    continue
+                if 'content' in df.columns:
+                    yield df[df['content'].apply(is_valid_string)]
+                else:
+                    yield df
 
 
 # Spawn spider crawler process
-def spawn_spider_process(urls, netloc_keywords, path_keywords, skip_domains, process_id, log_level, logfile, output_file, schema_keywords):
-    print(f"Args: urls: {urls}, netloc keywords: {netloc_keywords}, path keywords: {path_keywords}, skip domains: {skip_domains}, log level: {log_level}, log file: {logfile}, output file: {output_file}, process_id: {process_id}")
+def spawn_spider_process(urls, netloc_keywords, path_keywords, skip_domains, process_id, log_level, logfile, output_file, schema_keywords, jobdir=None, sitemap_max_urls=20000):
+    # urls may be numpy array from np.array_split -> convert to list
+    if not isinstance(urls, list):
+        try:
+            urls = list(urls)
+        except Exception:
+            urls = [str(urls)]
+    # filter empty
+    urls = [u for u in urls if u]
+
+    # per-worker logfile to avoid 16-process contention on same file
+    # if logfile is /x/log_20200101.log -> /x/log_20200101_worker_3.log
+    if logfile.endswith(".log"):
+        worker_logfile = logfile.replace(".log", f"_worker_{process_id}.log")
+    else:
+        worker_logfile = f"{logfile}_worker_{process_id}.log"
+    print(f"Args: urls: {len(urls)} urls, netloc keywords: {netloc_keywords}, path keywords: {path_keywords}, skip domains: {len(skip_domains)}, log level: {log_level}, log file: {worker_logfile}, output file: {output_file}, process_id: {process_id}, jobdir: {jobdir}")
     project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
     if project_root not in sys.path:
         sys.path.insert(0, project_root)
 
-    # Create scrapy CrawlerProcess
-    process = CrawlerProcess(
-        settings={
-            "ROBOTSTXT_OBEY": True,
-            "DOWNLOADER_MIDDLEWARES": {
-                "src.scrape.ScrapyCrawlMiddleware.TextTypeFilterMiddleware": 543  # High priority
-            },
-            "LOG_FILE": logfile,
-            "LOG_LEVEL": log_level,
-            "DOWNLOAD_CONTENT_TYPES": ["text/html", "application/xhtml+xml"],
-            "TWISTED_REACTOR": "twisted.internet.asyncioreactor.AsyncioSelectorReactor",
-        }
-    )
+    # Tuned global settings - spider custom_settings provides same but CrawlerProcess wins if set here
+    settings = {
+        "ROBOTSTXT_OBEY": True,
+        "DOWNLOADER_MIDDLEWARES": {
+            "src.scrape.ScrapyCrawlMiddleware.TextTypeFilterMiddleware": 543
+        },
+        "LOG_FILE": worker_logfile,
+        "LOG_LEVEL": log_level,
+        "LOG_ENABLED": True,
+        "DOWNLOAD_CONTENT_TYPES": ["text/html", "application/xhtml+xml", "application/xml", "text/xml"],
+        "TWISTED_REACTOR": "twisted.internet.asyncioreactor.AsyncioSelectorReactor",
+        # politeness-aware concurrency (global = workers * 16, per-domain =1)
+            "CONCURRENT_REQUESTS": 16,
+            "CONCURRENT_REQUESTS_PER_DOMAIN": 1,
+            "DOWNLOAD_DELAY": 1.0,
+        "AUTOTHROTTLE_ENABLED": True,
+        "AUTOTHROTTLE_START_DELAY": 1.0,
+        "AUTOTHROTTLE_MAX_DELAY": 3.0,
+        "AUTOTHROTTLE_TARGET_CONCURRENCY": 1.0,
+        "DOWNLOAD_TIMEOUT": 15,
+        "RETRY_TIMES": 2,
+        "DNSCACHE_ENABLED": True,
+        "DNSCACHE_SIZE": 10000,
+        "REACTOR_THREADPOOL_MAXSIZE": 20,
+    }
+    if jobdir:
+        settings["JOBDIR"] = jobdir
+        # Ensure jobdir exists
+        try:
+            os.makedirs(jobdir, exist_ok=True)
+        except Exception:
+            pass
+    process = CrawlerProcess(settings=settings)
 
-    # Configure logging
+    # Configure logging - per-worker file handler only
     root_logger = logging.getLogger()
     root_logger.setLevel(log_level)
+    # clear existing handlers to avoid duplicate
     root_logger.handlers = []
 
     # Define a filter to inject process_id into every LogRecord
@@ -69,17 +115,15 @@ def spawn_spider_process(urls, netloc_keywords, path_keywords, skip_domains, pro
             record.process_id = process_id
             return True
 
-    fileHandler = logging.FileHandler(logfile)
-    fileHandler.setLevel(log_level)
-
-    # Add the filter to the handler
-    fileHandler.addFilter(ProcessIdFilter())
-
-
-    # This format mimics Scrapy's default look
-    formatter = logging.Formatter('%(asctime)s %(levelname)s: %(name)s: worker_id: %(process_id)s: %(message)s', datefmt='%Y-%m-%d %H:%M:%S')
-    fileHandler.setFormatter(formatter)
-    root_logger.addHandler(fileHandler)
+    try:
+        fileHandler = logging.FileHandler(worker_logfile)
+        fileHandler.setLevel(log_level)
+        fileHandler.addFilter(ProcessIdFilter())
+        formatter = logging.Formatter('%(asctime)s %(levelname)s: %(name)s: worker_id: %(process_id)s: %(message)s', datefmt='%Y-%m-%d %H:%M:%S')
+        fileHandler.setFormatter(formatter)
+        root_logger.addHandler(fileHandler)
+    except Exception as e:
+        print(f"Could not create file handler for {worker_logfile}: {e}")
 
     # Explicitly set levels for Scrapy and other noisy loggers
     logging.getLogger('scrapy').setLevel(log_level)
@@ -90,18 +134,17 @@ def spawn_spider_process(urls, netloc_keywords, path_keywords, skip_domains, pro
     for logger_name in ['scrapy', 'twisted', 'sqlalchemy.engine']:
         logger = logging.getLogger(logger_name)
         logger.setLevel(log_level)
-        # Remove any handlers that might be printing to console
         for handler in logger.handlers[:]:
             logger.removeHandler(handler)
-        # Prevent logs from propagating up to the root logger's console handlers
         logger.propagate = True
-        # Silence the twisted engine too
         logging.getLogger('twisted').handlers = []
 
     # Create crawler from process
     spiderCrawler = process.create_crawler(HesitantSpider)
 
     # Crawl and configure spider
+    # auto-tune sitemap cap: single domain 100k needs higher cap, multi-domain lower is fine
+    # jobdir for resume when 100k single domain
     process.crawl(
         spiderCrawler,
         start_urls=urls,
@@ -122,7 +165,9 @@ def spawn_spider_process(urls, netloc_keywords, path_keywords, skip_domains, pro
         allowed_languages=["nl", "en", "en-uk", "en-gb", "nl-nl", "en-nl", "nl-en"],
         allowed_countries=["nl"],
         schema_keywords=schema_keywords,
-        timeout=3600 * 48  # 2 days
+        timeout=3600 * 48,  # 2 days
+        sitemap_max_urls=sitemap_max_urls,
+        jobdir=jobdir,
     )
 
     # If worker gets 0 urls, pass (shouldn't happen)
@@ -197,7 +242,25 @@ if __name__ == "__main__":
     if not os.path.exists(f"{CONFIG.output.output_dir}/{time_part}"):
         os.makedirs(f"{CONFIG.output.output_dir}/{time_part}")
 
+    # Enable JOBDIR for 100k single-domain resume (1 domain many pages via sitemap)
+    # Multi-domain 100k seeds: many workers, jobdir per worker is heavy churn -> disable
+    try:
+        unique_domains = len(set([urlparse(u).netloc.lower() for u in urls if u]))
+    except Exception:
+        unique_domains = len(urls)
+    enable_jobdir = False
+    # Single domain (1 seed or 1 unique netloc) benefits from resume for long 27h jobs
+    if unique_domains == 1:
+        enable_jobdir = True
+    # Also enable if config says large crawl (>5k pages)
+    try:
+        if CONFIG.crawl.max_visits and int(CONFIG.crawl.max_visits) > 5000 and unique_domains == 1:
+            enable_jobdir = True
+    except Exception:
+        pass
+
     for i in range(0, num_workers):
+        jobdir = f"{CONFIG.output.output_dir}/{time_part}/jobdir_worker_{i}" if enable_jobdir else None
         chunked_args.append(
             (
                 url_chunks[i],
@@ -208,7 +271,9 @@ if __name__ == "__main__":
                 logging_level,
                 logfile,
                 f"{CONFIG.output.output_dir}/{time_part}/worker_{i}.parquet",  # Different output files per worker
-                [CONFIG.crawl.schema.keyword]
+                [CONFIG.crawl.schema.keyword],
+                jobdir,
+                50000 if enable_jobdir else 20000,  # higher sitemap cap for 100k single domain
             )
         )
 
