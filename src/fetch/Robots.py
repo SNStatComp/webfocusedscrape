@@ -44,6 +44,36 @@ class RobotsFetcher(IFetcher):
         """
         return self.results
 
+    def get_crawl_delay(self, domain: str, user_agent: str = "*") -> float | None:
+        """Return Crawl-delay for domain/user_agent from robots.txt, if present."""
+        try:
+            parser = self.fetch(domain)
+            # Python 3.8+ has crawl_delay
+            if hasattr(parser, "crawl_delay"):
+                d = parser.crawl_delay(user_agent)
+                if d is not None:
+                    return float(d)
+            # fallback parse raw
+            # RobotFileParser stores lines, try to find Crawl-delay
+            try:
+                # access raw entries if available
+                if hasattr(parser, "default_entry") and parser.default_entry:
+                    # try to find in entries
+                    for entry in getattr(parser, "entries", []) or []:
+                        if user_agent in entry.useragents or "*" in entry.useragents:
+                            if hasattr(entry, "delay") and entry.delay is not None:
+                                return float(entry.delay)
+                            if hasattr(entry, "req_rate") and entry.req_rate:
+                                # req_rate is namedtuple (requests, seconds)
+                                rr = entry.req_rate
+                                if rr and rr[0]:
+                                    return float(rr[1] / rr[0])
+            except Exception:
+                pass
+            return None
+        except Exception:
+            return None
+
     def get_sitemap_urls(self, domain: str) -> List[str]:
         """Get a list of sitemaps listed on robots.txt"""
         try:
