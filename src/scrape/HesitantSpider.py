@@ -57,31 +57,31 @@ class HesitantSpider(scrapy.Spider):
 
         # Set and log attributes
         self.start_urls = start_urls
-        self.logger.debug(f"Init start_urls: {self.start_urls}")
+        self.logger.info(f"Init start_urls: {self.start_urls}")
         self.max_depth = max_depth
-        self.logger.debug(f"Init max depth: {self.max_depth}")
+        self.logger.info(f"Init max depth: {self.max_depth}")
         self.skip_domains = skip_domains
-        self.logger.debug(f"Init skip domains: {self.skip_domains}")
+        self.logger.info(f"Init skip domains: {self.skip_domains}")
         self.skip_paths = skip_paths
-        self.logger.debug(f"Init skip domains: {self.skip_paths}")
+        self.logger.info(f"Init skip domains: {self.skip_paths}")
         self.allowed_top_level_domains = allowed_top_level_domains
-        self.logger.debug(f"Init allowed_top_level_domains: {self.allowed_top_level_domains}")
+        self.logger.info(f"Init allowed_top_level_domains: {self.allowed_top_level_domains}")
         self.target_netloc_keywords = target_netloc_keywords
-        self.logger.debug(f"Init target netloc keywords: {self.target_netloc_keywords}")
+        self.logger.info(f"Init target netloc keywords: {self.target_netloc_keywords}")
         self.target_path_keywords = target_path_keywords
-        self.logger.debug(f"Init target paths keywords: {self.target_path_keywords}")
+        self.logger.info(f"Init target paths keywords: {self.target_path_keywords}")
         self.batch_size = batch_size
-        self.logger.debug(f"Init batch_size: {self.batch_size}")
+        self.logger.info(f"Init batch_size: {self.batch_size}")
         self.allowed_languages = allowed_languages
-        self.logger.debug(f"Init allowed languages: {self.allowed_languages}")
+        self.logger.info(f"Init allowed languages: {self.allowed_languages}")
         self.allowed_countries = allowed_countries
-        self.logger.debug(f"Init allowed countries: {self.allowed_countries}")
+        self.logger.info(f"Init allowed countries: {self.allowed_countries}")
         self.max_jumps = max_jumps
-        self.logger.debug(f"Init max_jumps: {self.max_jumps}")
+        self.logger.info(f"Init max_jumps: {self.max_jumps}")
         self.output_file = output_file
-        self.logger.debug(f"Init output file: {self.output_file}")
+        self.logger.info(f"Init output file: {self.output_file}")
         self.sitemaps_tocheck = sitemaps_tocheck
-        self.logger.debug(f"Check urls found on (potential) sitemaps: {self.sitemaps_tocheck}")
+        self.logger.info(f"Check urls found on (potential) sitemaps: {self.sitemaps_tocheck}")
 
         # Start batch counter
         self.batch_counter = 0
@@ -98,11 +98,11 @@ class HesitantSpider(scrapy.Spider):
             ".woff", ".mpg", ".qt", ".rm", ".swf", ".wmv", ".m4a", ".css", ".pdf", ".doc", ".docx", ".exe", ".bin", ".rss", ".zip",
             ".rar", ".msu", ".flv", ".dmg", ".xls", ".xlsx", ".ico"
         }
-        self.logger.debug(f"URLs will be excluded if they contain any in path:{', '.join(self._unsupported)}")
+        self.logger.info(f"URLs will be excluded if they contain any in path:{', '.join(self._unsupported)}")
 
         # Set schema parser
         self._schemaparser = SchemaParser(schema_keywords=schema_keywords)
-        self.logger.debug(f"Init schemaparser with keywords: {schema_keywords}")
+        self.logger.info(f"Init schemaparser with keywords: {schema_keywords}")
 
         # Init batch, results, visited 
         self.batch = []
@@ -439,7 +439,7 @@ if __name__ == "__main__":
 
     CONFIG = setup("config/config.yaml")
 
-    logging_level = logging.DEBUG
+    logging_level = "INFO"  # "DEBUG" or "INFO" or whatever
 
     dir_log = f"{CONFIG.output.output_dir}/{CONFIG.output.logs}"
     if not os.path.exists(dir_log):
@@ -451,6 +451,7 @@ if __name__ == "__main__":
         settings={
             "ROBOTSTXT_OBEY": True,
             "LOG_FILE": logfile,
+            "LOG_LEVEL": logging_level,  # Set the logging level
             "DOWNLOADER_MIDDLEWARES": {
                 "src.scrape.ScrapyCrawlMiddleware.TextTypeFilterMiddleware": 543  # High priority
             },
