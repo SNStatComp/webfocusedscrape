@@ -80,15 +80,15 @@ def spawn_spider_process(urls, netloc_keywords, path_keywords, skip_domains, pro
         "LOG_ENABLED": True,
         "DOWNLOAD_CONTENT_TYPES": ["text/html", "application/xhtml+xml", "application/xml", "text/xml"],
         "TWISTED_REACTOR": "twisted.internet.asyncioreactor.AsyncioSelectorReactor",
-        # politeness-aware concurrency (global = workers * 16, per-domain =1)
+        # Alt C: as fast as possible, polite via robots.txt + 429 backoff
             "CONCURRENT_REQUESTS": 16,
-            "CONCURRENT_REQUESTS_PER_DOMAIN": 1,
-            "DOWNLOAD_DELAY": 1.0,
+            "CONCURRENT_REQUESTS_PER_DOMAIN": 4,
+            "DOWNLOAD_DELAY": 0,
         "AUTOTHROTTLE_ENABLED": True,
         "AUTOTHROTTLE_START_DELAY": 1.0,
-        "AUTOTHROTTLE_MAX_DELAY": 3.0,
-        "AUTOTHROTTLE_TARGET_CONCURRENCY": 1.0,
-        "DOWNLOAD_TIMEOUT": 15,
+        "AUTOTHROTTLE_MAX_DELAY": 10.0,
+        "AUTOTHROTTLE_TARGET_CONCURRENCY": 2.0,
+        "DOWNLOAD_TIMEOUT": 10,
         "RETRY_TIMES": 2,
         "DNSCACHE_ENABLED": True,
         "DNSCACHE_SIZE": 10000,
@@ -249,15 +249,15 @@ if __name__ == "__main__":
     except Exception:
         unique_domains = len(urls)
     enable_jobdir = False
-    # Single domain (1 seed or 1 unique netloc) benefits from resume for long 27h jobs
+    # Alt C: only enable JOBDIR for large single-domain crawls >5k pages (27h resume), not for 20 seeds 100s pages test
     if unique_domains == 1:
-        enable_jobdir = True
-    # Also enable if config says large crawl (>5k pages)
-    try:
-        if CONFIG.crawl.max_visits and int(CONFIG.crawl.max_visits) > 5000 and unique_domains == 1:
-            enable_jobdir = True
-    except Exception:
-        pass
+        try:
+            if CONFIG.crawl.max_visits and int(CONFIG.crawl.max_visits) > 5000:
+                enable_jobdir = True
+        except Exception:
+            pass
+        # also if single seed via sitemap likely large, but keep off for 20 seeds test
+        # fallback: keep disabled for small runs to avoid per-parse visited.txt overhead
 
     for i in range(0, num_workers):
         jobdir = f"{CONFIG.output.output_dir}/{time_part}/jobdir_worker_{i}" if enable_jobdir else None

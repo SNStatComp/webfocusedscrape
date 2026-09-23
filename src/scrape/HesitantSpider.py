@@ -20,20 +20,19 @@ from src.util import normalize_url
 class HesitantSpider(scrapy.Spider):
     name = "hesitant-spider"
 
-    # Tuned for NSI politeness: per-domain polite, globally high throughput.
-    # Each worker is a separate OS process (16-32 workers), so global concurrency = workers * CONCURRENT_REQUESTS.
-    # With 16 workers * 16 = 256 global, but PER_DOMAIN=1 and DOWNLOAD_DELAY=1.0 guarantees ~1 req/s/domain.
+    # Alt C: as fast as possible, polite via robots.txt Crawl-delay + backoff on 429, else 0 delay
+    # Multi-domain 100k benefits from global 256, per-domain 4 bursts, AutoThrottle backs off
     custom_settings = {
         "USER_AGENT": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36",
         "AUTOTHROTTLE_ENABLED": True,
         "AUTOTHROTTLE_START_DELAY": 1.0,
-        "AUTOTHROTTLE_MAX_DELAY": 3.0,
-        "AUTOTHROTTLE_TARGET_CONCURRENCY": 1.0,
+        "AUTOTHROTTLE_MAX_DELAY": 10.0,
+        "AUTOTHROTTLE_TARGET_CONCURRENCY": 2.0,
         "AUTOTHROTTLE_DEBUG": False,
         "CONCURRENT_REQUESTS": 16,
-        "CONCURRENT_REQUESTS_PER_DOMAIN": 1,
-        "DOWNLOAD_DELAY": 1.0,               # base politeness; AutoThrottle will increase if needed
-        "DOWNLOAD_TIMEOUT": 15,              # allow slower JS hosts; Playwright handles its own 20s
+        "CONCURRENT_REQUESTS_PER_DOMAIN": 4,
+        "DOWNLOAD_DELAY": 0,               # Alt C: 0 else from robots.txt Crawl-delay
+        "DOWNLOAD_TIMEOUT": 10,              # faster fail for 100k scale
         "RETRY_TIMES": 2,
         "RETRY_HTTP_CODES": [500, 502, 503, 504, 408, 429],
         "DNSCACHE_ENABLED": True,
@@ -119,17 +118,12 @@ class HesitantSpider(scrapy.Spider):
         # per-domain crawl-delay cache
         self._crawl_delay_cache = {}
 
-        # Set parser and unsupported endpoints - auto-tune Playwright concurrency for single vs multi domain
+        # Alt C: as fast as possible - keep 4 concurrent Playwright pages even single domain, politeness via DOWNLOAD_DELAY / 429 backoff not semaphore
         if playwright_max_concurrent is None:
-            try:
-                uniq = len(set(urlparse(u).netloc.lower() for u in (start_urls or []) if u))
-            except Exception:
-                uniq = len(start_urls) if start_urls else 0
-            # single domain -> 1 concurrent page keeps 1 req/s polite; multi -> 4
-            playwright_max_concurrent = 1 if uniq <= 1 else 4
+            playwright_max_concurrent = 4
         self._htmlparser = HTMLBodyParser()
         self._fetcher = PlaywrightTextFetcher(max_concurrent_pages=playwright_max_concurrent)
-        self.logger.debug(f"Playwright max_concurrent_pages auto={playwright_max_concurrent} for {len(start_urls)} start_urls")
+        self.logger.debug(f"Playwright max_concurrent_pages={playwright_max_concurrent} for {len(start_urls)} start_urls (Alt C)")
         self._unsupported = {
             ".ics", ".mng", ".pct", ".bmp", ".gif", ".jpg", ".jpeg", ".png", ".pst", ".psp", ".tif", ".tiff", ".drw", ".dxf", ".eps",
             ".woff2", ".svg", ".mp3", ".wma", ".ogg", ".wav", ".ra", ".aac", ".mid", ".aiff", ".3gp", ".asf", ".asx", ".avi", ".mp4",
@@ -149,6 +143,9 @@ class HesitantSpider(scrapy.Spider):
         self.sitemaps_crawled = set()
         # executor for offloading parquet writes (avoid blocking reactor)
         self._save_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="parquet-save")
+        # buffer for visited persistence to avoid per-parse open/close (Alt C: batch 100)
+        self._visited_buffer = []
+        self._sitemaps_buffer = []
 
         # JOBDIR resume: load visited if exists (100k single domain)
         if self.jobdir:
@@ -434,31 +431,45 @@ class HesitantSpider(scrapy.Spider):
         _canon = response.url.split("#")[0].rstrip("/")
         if _canon != response.url:
             self.visited.add(_canon)
-        # JOBDIR visited persistence (append)
+        # JOBDIR visited persistence - batched to avoid per-parse blocking (Alt C)
         if self.jobdir:
-            try:
-                import os
-                os.makedirs(self.jobdir, exist_ok=True)
-                with open(os.path.join(self.jobdir, "visited.txt"), "a", encoding="utf-8") as f:
-                    f.write(response.url + "\n")
-                    if _canon != response.url:
-                        f.write(_canon + "\n")
-            except Exception:
-                pass
+            self._visited_buffer.append(response.url)
+            if _canon != response.url:
+                self._visited_buffer.append(_canon)
+            # flush every 100 or via executor
+            if len(self._visited_buffer) >= 100:
+                try:
+                    import os
+                    os.makedirs(self.jobdir, exist_ok=True)
+                    buf = self._visited_buffer
+                    self._visited_buffer = []
+                    # offload via executor
+                    def _flush_visited(b=buf, jd=self.jobdir):
+                        with open(os.path.join(jd, "visited.txt"), "a", encoding="utf-8") as f:
+                            f.write("\n".join(b) + "\n")
+                    self._save_executor.submit(_flush_visited)
+                except Exception:
+                    pass
 
         # Add sitemap discovery
         if parsed_url.netloc.lower() not in self.sitemaps_crawled:
             self.sitemaps_crawled.add(parsed_url.netloc.lower())
             self.logger.debug(f"New domain detected: {parsed_url.netloc.lower()}. Checking for sitemaps...")
-            # persist sitemaps_crawled if JOBDIR
+            # persist sitemaps_crawled batched if JOBDIR
             if self.jobdir:
-                try:
-                    import os
-                    os.makedirs(self.jobdir, exist_ok=True)
-                    with open(os.path.join(self.jobdir, "sitemaps_crawled.txt"), "a", encoding="utf-8") as f:
-                        f.write(parsed_url.netloc.lower() + "\n")
-                except Exception:
-                    pass
+                self._sitemaps_buffer.append(parsed_url.netloc.lower())
+                if len(self._sitemaps_buffer) >= 20:
+                    try:
+                        import os
+                        os.makedirs(self.jobdir, exist_ok=True)
+                        buf = self._sitemaps_buffer
+                        self._sitemaps_buffer = []
+                        def _flush_sitemap(b=buf, jd=self.jobdir):
+                            with open(os.path.join(jd, "sitemaps_crawled.txt"), "a", encoding="utf-8") as f:
+                                f.write("\n".join(b) + "\n")
+                        self._save_executor.submit(_flush_sitemap)
+                    except Exception:
+                        pass
 
             for sitemap_path in self.sitemaps_tocheck:
                 # Construct the sitemap URL
@@ -466,7 +477,7 @@ class HesitantSpider(scrapy.Spider):
                 # apply crawl-delay for this netloc if robots specifies
                 md = {}
                 d = self._get_crawl_delay(parsed_url.netloc)
-                if d and d > 1.0:
+                if d and d > 0:
                     md["download_delay"] = float(d)
 
                 # YIELD the request so Scrapy handles it
@@ -550,7 +561,7 @@ class HesitantSpider(scrapy.Spider):
             if delay is None:
                 delay = self._fetcher.robotsfetcher.get_crawl_delay(nl, "*")
             self._crawl_delay_cache[nl] = delay
-            if delay and delay > 1.0:
+            if delay and delay > 0:
                 self.logger.info(f"Crawl-delay for {nl}: {delay}s (polite)")
             return delay
         except Exception as e:
@@ -588,10 +599,10 @@ class HesitantSpider(scrapy.Spider):
             except Exception:
                 continue
 
-            # Apply crawl-delay via download_delay meta if robots specifies >1s
+            # Alt C: respect robots.txt Crawl-delay if >0 else 0 (as fast as possible)
             delay = self._get_crawl_delay(parsed_url.netloc)
             meta_delay = {}
-            if delay and delay > 1.0:
+            if delay and delay > 0:
                 meta_delay["download_delay"] = float(delay)
 
             # Check if the discovered URL is itself a sitemap (to allow recursive discovery)
@@ -633,12 +644,27 @@ class HesitantSpider(scrapy.Spider):
     # Called when the spider closes cleanly
     async def closed(self, reason):
         self.save_batch()
+        # flush visited/sitemap buffers if JOBDIR
+        if self.jobdir:
+            try:
+                import os
+                os.makedirs(self.jobdir, exist_ok=True)
+                if self._visited_buffer:
+                    with open(os.path.join(self.jobdir, "visited.txt"), "a", encoding="utf-8") as f:
+                        f.write("\n".join(self._visited_buffer) + "\n")
+                    self._visited_buffer = []
+                if self._sitemaps_buffer:
+                    with open(os.path.join(self.jobdir, "sitemaps_crawled.txt"), "a", encoding="utf-8") as f:
+                        f.write("\n".join(self._sitemaps_buffer) + "\n")
+                    self._sitemaps_buffer = []
+            except Exception:
+                pass
         try:
             await self._fetcher.close()
         except Exception as e:
             self.logger.debug(f"Error closing fetcher: {e}")
         try:
-            self._save_executor.shutdown(wait=False)
+            self._save_executor.shutdown(wait=True)
         except Exception:
             pass
         self.logger.info(f"Spider closed because of: {reason}. Total collected pages: {len(self.results)}")
