@@ -29,6 +29,7 @@ crawl:
   max_duration: 500
   max_visits: 200
   max_depth: 2
+  max_jumps: 1
   use_sitemap: True
   schema:
     keyword:

@@ -1,20 +1,22 @@
-import re
-import scrapy
-import time
 import logging
-from datetime import datetime
+import re
+import time
 from concurrent.futures import ThreadPoolExecutor
+from datetime import datetime
+from typing import List
+from urllib.parse import parse_qs, urljoin, urlparse
 
 import pandas as pd
-
+import scrapy
+import tldextract
 from scrapy.exceptions import CloseSpider
-from typing import List
-from urllib.parse import urljoin, urlparse, parse_qs
 
-from src.parse import HTMLBodyParser, SchemaParser
 from src.fetch import PlaywrightTextFetcher
+from src.parse import HTMLBodyParser, SchemaParser
 from src.scrape.ScrapyResult import ScrapyResult
 from src.util import normalize_url
+
+_TLD_EXTRACT = tldextract.TLDExtract(suffix_list_urls=())
 
 
 class HesitantSpider(scrapy.Spider):
@@ -47,7 +49,7 @@ class HesitantSpider(scrapy.Spider):
         start_urls: List[str],  # List of starting (base) urls
         target_netloc_keywords: List[str] = [], # List of keywords to determine targeting of URL netlocs
         target_path_keywords: List[str] = [],  # list of keywords to determine targeting of URL paths
-        max_depth: int = 2,  # Maximum crawling depth with hesitancy
+        max_depth: int = 2,  # Maximum non-target exploration steps
         skip_domains: List[str] = [],  # List of domains to skip
         skip_paths: List[str] = [],  # List of in-website paths to skip
         allowed_top_level_domains: List[str] = [".com"],  # List of allowed top level domains
@@ -173,39 +175,62 @@ class HesitantSpider(scrapy.Spider):
         if max_depth < 0:
             self.logger.debug("Only urls from starting_url can be found, max_depth < 0")
 
+    @classmethod
+    def _site_domain(cls, url: str) -> str:
+        if not url:
+            return ""
+        try:
+            host = (urlparse(url if "://" in url else f"//{url}").hostname or "").lower().rstrip(".")
+            extracted = _TLD_EXTRACT(host)
+            return f"{extracted.domain}.{extracted.suffix}".lower() if extracted.domain and extracted.suffix else host
+        except ValueError:
+            return ""
+
+    def _scope(self, url: str, meta: dict | None = None) -> dict | None:
+        if meta is None:
+            domain = self._site_domain(url)
+            return {
+                "base_url": url,
+                "base_domain": domain,
+                "branch_domain": domain,
+                "steps_from_target": 0,
+                "depth": 0,
+                "jumps": 0,
+            }
+
+        base_domain = str(meta.get("base_domain") or self._site_domain(meta.get("base_url", "")))
+        branch_domain = str(meta.get("branch_domain") or base_domain)
+        jumps = int(meta.get("jumps") or 0)
+        domain = self._site_domain(url)
+        if not domain:
+            return None
+        if domain == base_domain:
+            branch_domain = base_domain
+        elif domain != branch_domain:
+            if branch_domain != base_domain or jumps >= self.max_jumps:
+                return None
+            branch_domain, jumps = domain, 1
+        return {**meta, "base_domain": base_domain, "branch_domain": branch_domain, "jumps": jumps}
+
     # Asynchronous function that starts the crawl
     async def start(self):
         self.start_time = time.time()
-        # For each start url, start crawling
         for start_url in self.start_urls:
+            initial_meta = self._scope(start_url)
+            self.sitemaps_crawled.add(initial_meta["base_domain"])
             yield scrapy.Request(
                 url=start_url,
                 callback=self.parse,
                 errback=self.handle_error,
-                meta={
-                    "base_url": start_url,
-                    "current_start": start_url,
-                    "steps_from_target": 0,
-                    "depth": 0,
-                    "jumps": 0
-                }
+                meta=initial_meta,
             )
-            # next, if desired, check the sitemapurls to augment existing results
-            parsed_url = urlparse(start_url)
-            self.sitemaps_crawled.add(parsed_url.netloc)
-            for sitemap in self.sitemaps_tocheck:
-                url = f"{parsed_url.scheme}://{parsed_url.netloc}/{sitemap}"
+            for sitemap_path in self.sitemaps_tocheck:
+                sitemap_url = urljoin(initial_meta["base_url"], sitemap_path)
                 yield scrapy.Request(
-                    url=url,
+                    url=sitemap_url,
                     callback=self.parse_sitemap,
                     errback=self.handle_error,
-                    meta={
-                        "base_url": start_url,
-                        "current_start": start_url,
-                        "steps_from_target": 0,
-                        "depth": 0,
-                        "jumps": 0
-                    }
+                    meta={**initial_meta, "sitemap": True},
                 )
 
     # Save current batch to disk - sync but batched larger (500) to amortize cost
@@ -394,56 +419,55 @@ class HesitantSpider(scrapy.Spider):
 
     # Process request response
     async def parse(self, response):
-        # Check if we passed timeout
         if time.time() - self.start_time > self.timeout:
             print(f"Hit timeout {self.timeout} seconds for spider with start urls: {self.start_urls}!")
             self.logger.debug(f"Hit timeout {self.timeout} seconds for spider with start urls: {self.start_urls}!")
             raise CloseSpider('bandwidth_exceeded')
-        current_depth = response.meta.get("depth", 0)
-        steps_from_target = response.meta.get("steps_from_target", 0)
 
-        # Check if url is target
+        scope = self._scope(response.url, response.meta)
+        if scope is None:
+            self.logger.debug(f"Skipping out-of-scope response: {response.url}")
+            return
+        response_domain = self._site_domain(response.url)
+        base_domain = scope["base_domain"]
+        branch_domain = scope["branch_domain"]
+        if response_domain not in {base_domain, branch_domain}:
+            self.logger.debug(f"Skipping out-of-scope response: {response.url}")
+            return
+        if response_domain == base_domain and branch_domain != base_domain:
+            scope["branch_domain"] = base_domain
+        if scope["jumps"] > self.max_jumps:
+            self.logger.debug(
+                f"Skipping out-of-budget response: {response.url}, "
+                f"jumps={scope['jumps']}"
+            )
+            return
+
+        current_depth = int(response.meta.get("depth") or 0)
+        steps_from_target = int(response.meta.get("steps_from_target") or 0)
         url_is_targeted, first_keyword_hit = self.url_is_target(response.url)
-
-        # If url is not target and exceeds hesitancy depth, return
         if not url_is_targeted and steps_from_target >= self.max_depth:
             return
 
-        # Determine whether we need to add a jump
-        jumps = response.meta.get("jumps", 0)
-
-        parsed_url = urlparse(response.url)
-        current_netloc = parsed_url.netloc.lower().rsplit(".", 1)[0]
-        meta_netloc = urlparse(response.meta.get("current_start")).netloc.lower().rsplit(".", 1)[0]
-        if current_netloc != meta_netloc and response.meta.get("redirect_urls") is None:
-            self.logger.debug(f"Adding jump from {jumps} to {jumps + 1} going with base url: {meta_netloc} to {current_netloc}")
-            jumps += 1
-
-        # If we exceed jumps, return
-        if jumps > self.max_jumps:
-            self.logger.debug(f"Ending crawl path due to exceeding jumps ({jumps}/{self.max_jumps}) for {response.url}, base url: {response.meta.get("base_url")}")
-            return
-
-        # Process response if above skip-conditions not met
-        self.logger.debug(f"Parsing url: {response.url}, targeted: {url_is_targeted}, depth: {current_depth}, steps from target: {steps_from_target}, jumps: {jumps}")
+        self.logger.debug(
+            f"Parsing url: {response.url}, targeted: {url_is_targeted}, "
+            f"depth: {current_depth}, steps from target: {steps_from_target}, "
+            f"jumps: {scope['jumps']}"
+        )
         self.visited.add(response.url)
-        # also store canonical without fragment/trailing slash for dedup
         _canon = response.url.split("#")[0].rstrip("/")
         if _canon != response.url:
             self.visited.add(_canon)
-        # JOBDIR visited persistence - batched to avoid per-parse blocking (Alt C)
         if self.jobdir:
             self._visited_buffer.append(response.url)
             if _canon != response.url:
                 self._visited_buffer.append(_canon)
-            # flush every 100 or via executor
             if len(self._visited_buffer) >= 100:
                 try:
                     import os
                     os.makedirs(self.jobdir, exist_ok=True)
                     buf = self._visited_buffer
                     self._visited_buffer = []
-                    # offload via executor
                     def _flush_visited(b=buf, jd=self.jobdir):
                         with open(os.path.join(jd, "visited.txt"), "a", encoding="utf-8") as f:
                             f.write("\n".join(b) + "\n")
@@ -451,13 +475,11 @@ class HesitantSpider(scrapy.Spider):
                 except Exception:
                     pass
 
-        # Add sitemap discovery
-        if parsed_url.netloc.lower() not in self.sitemaps_crawled:
-            self.sitemaps_crawled.add(parsed_url.netloc.lower())
-            self.logger.debug(f"New domain detected: {parsed_url.netloc.lower()}. Checking for sitemaps...")
-            # persist sitemaps_crawled batched if JOBDIR
+        if response_domain == base_domain and base_domain not in self.sitemaps_crawled:
+            self.sitemaps_crawled.add(base_domain)
+            self.logger.debug(f"Checking base-domain sitemaps for {base_domain}")
             if self.jobdir:
-                self._sitemaps_buffer.append(parsed_url.netloc.lower())
+                self._sitemaps_buffer.append(base_domain)
                 if len(self._sitemaps_buffer) >= 20:
                     try:
                         import os
@@ -471,79 +493,58 @@ class HesitantSpider(scrapy.Spider):
                     except Exception:
                         pass
 
+            parsed_url = urlparse(response.url)
             for sitemap_path in self.sitemaps_tocheck:
-                # Construct the sitemap URL
                 sitemap_url = urljoin(f"{parsed_url.scheme}://{parsed_url.netloc}/", sitemap_path)
-                # apply crawl-delay for this netloc if robots specifies
-                md = {}
-                d = self._get_crawl_delay(parsed_url.netloc)
-                if d and d > 0:
-                    md["download_delay"] = float(d)
-
-                # YIELD the request so Scrapy handles it
+                delay = self._get_crawl_delay(parsed_url.netloc)
+                delay_meta = {"download_delay": float(delay)} if delay and delay > 0 else {}
                 yield scrapy.Request(
                     url=sitemap_url,
                     callback=self.parse_sitemap,
                     errback=self.handle_error,
                     meta={
-                        "base_url": response.meta.get("base_url"),
-                        "current_start": f"{parsed_url.scheme}://{parsed_url.netloc}",
+                        **scope,
                         "depth": current_depth,
                         "steps_from_target": steps_from_target,
-                        "jumps": jumps,
-                        **md,
-                    }
+                        **delay_meta,
+                    },
                 )
 
-        # Extract and follow links
         for link in response.css("a::attr(href)").getall():
             url = urljoin(response.url, link)
-
-            # Only continue with valid crawl paths
             if self.skip_this_url(url):
                 continue
-
+            child_scope = self._scope(url, scope)
+            if child_scope is None:
+                self.logger.debug(f"Skipping out-of-scope link: {url}")
+                continue
+            child_scope["depth"] = current_depth + 1
+            child_scope["steps_from_target"] = 0 if url_is_targeted else steps_from_target + 1
             yield scrapy.Request(
                 url=url,
                 callback=self.parse,
                 errback=self.handle_error,
-                meta={
-                    "base_url": response.meta.get("base_url"),
-                    "current_start": f"{parsed_url.scheme}://{parsed_url.netloc}",
-                    "depth": current_depth + 1,
-                    "steps_from_target": steps_from_target + 1,
-                    "jumps": jumps
-                },
-                dont_filter=False  # Skip duplicates
+                meta=child_scope,
+                dont_filter=False,
             )
 
-        # Process the current page
         if url_is_targeted:
-            self.logger.debug(f"Found targeted url: {response.url} from base url {response.meta.get("base_url")}")
-            # Determine schema.org indicator
-            schema_indicator = True if self._schemaparser.parse(response=response) else False
-
-            # Add result to batch
+            self.logger.debug(f"Found targeted url: {response.url} from base url {scope['base_url']}")
+            schema_indicator = bool(self._schemaparser.parse(response=response))
             result = ScrapyResult(
-                    base_url=str(response.meta.get("base_url")),
-                    url=response.url,
-                    status=response.status,
-                    first_keyword_hit=first_keyword_hit,
-                    content=await self._fetcher.fetch(response.url),
-                    crawl_depth=current_depth,
-                    schema_indicator=schema_indicator,
-                    timestamp=datetime.now().strftime("%Y-%m-%d-%H:%M:%S")
-                )
-
+                base_url=str(scope["base_url"]),
+                url=response.url,
+                status=response.status,
+                first_keyword_hit=first_keyword_hit,
+                content=await self._fetcher.fetch(response.url),
+                crawl_depth=current_depth,
+                schema_indicator=schema_indicator,
+                timestamp=datetime.now().strftime("%Y-%m-%d-%H:%M:%S"),
+            )
             self.batch.append(result)
-
-            # Save batch if exceeding batch size
             if len(self.batch) >= self.batch_size:
                 self.save_batch()
 
-            # Reset current depth because we found target at current page
-            steps_from_target = 0
-    
     def _get_crawl_delay(self, netloc: str) -> float | None:
         """Return crawl-delay for netloc from robots.txt, cached. Honors NSI politeness."""
         if not netloc:
@@ -570,72 +571,66 @@ class HesitantSpider(scrapy.Spider):
             return None
 
     def parse_sitemap(self, response):
-        # Extract all URLs from the sitemap, accounting for namespace (robust fallback)
+        scope = self._scope(response.url, response.meta)
+        if scope is None:
+            return
+        base_domain = scope["base_domain"]
+        if self._site_domain(response.url) != base_domain:
+            self.logger.debug(f"Skipping external sitemap: {response.url}")
+            return
+
         ns = {'ns': 'http://www.sitemaps.org/schemas/sitemap/0.9'}
         urls = response.xpath('//ns:url/ns:loc/text() | //ns:sitemap/ns:loc/text()', namespaces=ns).getall()
-        # fallback for sitemaps without proper ns handling (common)
         if not urls:
             urls = response.xpath('//*[local-name()="loc"]/text()').getall()
         if not urls:
             urls = response.xpath('//loc/text()').getall()
 
-        # Cap burst for 100k single domain to avoid scheduler spike; log and truncate
         if len(urls) > self.sitemap_max_urls:
-            self.logger.warning(f"Sitemap {response.url} has {len(urls)} urls, capping to {self.sitemap_max_urls} (sitemap_max_urls)")
+            self.logger.warning(
+                f"Sitemap {response.url} has {len(urls)} urls, "
+                f"capping to {self.sitemap_max_urls} (sitemap_max_urls)"
+            )
             urls = urls[:self.sitemap_max_urls]
         else:
             self.logger.debug(f"Sitemap {response.url} yielded {len(urls)} urls")
 
-        # Respect crawl-delay per discovered netloc (NSI polite)
-        # Cache delay per netloc to avoid repeated robots fetch
         count = 0
         for url in urls:
             url = normalize_url(url)
-            # Only continue with valid crawl paths
-            if self.skip_this_url(url):
-                continue
-            try:
-                parsed_url = urlparse(url)
-            except Exception:
+            if self._site_domain(url) != base_domain or self.skip_this_url(url):
                 continue
 
-            # Alt C: respect robots.txt Crawl-delay if >0 else 0 (as fast as possible)
+            sitemap_scope = {
+                **scope,
+                "branch_domain": base_domain,
+                "jumps": 0,
+                "steps_from_target": 0,
+                "depth": int(response.meta.get("depth") or 0) + 1,
+            }
+            parsed_url = urlparse(url)
             delay = self._get_crawl_delay(parsed_url.netloc)
-            meta_delay = {}
             if delay and delay > 0:
-                meta_delay["download_delay"] = float(delay)
+                sitemap_scope["download_delay"] = float(delay)
 
-            # Check if the discovered URL is itself a sitemap (to allow recursive discovery)
-            # If it ends in .xml, we should probably call parse_sitemap again
             if url.lower().endswith('.xml'):
                 yield scrapy.Request(
                     url=url,
                     callback=self.parse_sitemap,
                     errback=self.handle_error,
-                    meta={
-                        "base_url":  response.meta.get("base_url"),
-                        "current_start": f"{parsed_url.scheme}://{parsed_url.netloc}",
-                        "depth": response.meta.get("depth", 0) + 1,
-                        **meta_delay,
-                    }
+                    meta=sitemap_scope,
                 )
             else:
-                # Otherwise, it's a regular page
                 yield scrapy.Request(
                     url=url,
                     callback=self.parse,
                     errback=self.handle_error,
-                    meta={
-                        "base_url":  response.meta.get("base_url"),
-                        "current_start": f"{parsed_url.scheme}://{parsed_url.netloc}",
-                        "depth": response.meta.get("depth", 0) + 1,
-                        **meta_delay,
-                    }
+                    meta=sitemap_scope,
                 )
             count += 1
-            # internal batch logging only
             if count % self.sitemap_batch_size == 0:
                 self.logger.debug(f"Sitemap {response.url}: enqueued {count} after filtering")
+
 
     def handle_error(self, failure):
         # TODO pass some specific errors to info?
@@ -674,7 +669,9 @@ class HesitantSpider(scrapy.Spider):
 if __name__ == "__main__":
     import os
     from datetime import datetime
+
     from scrapy.crawler import CrawlerProcess
+
     from src.util import setup
 
     CONFIG = setup("config/config.yaml")
@@ -706,7 +703,7 @@ if __name__ == "__main__":
     target_keywords = ["philosophy"]
     sitemaps_tocheck = ["sitemap.xml"]
     allowed_top_level_domains = [".com", ".nl"]
-    max_depth = 1
+    max_depth = 2
 
     # urls = ['https://werkenbijhetcbs.nl/']
     # target_keywords = ["enqueteur"]

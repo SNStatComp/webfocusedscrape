@@ -80,10 +80,9 @@ def spawn_spider_process(urls, netloc_keywords, path_keywords, skip_domains, pro
         "LOG_ENABLED": True,
         "DOWNLOAD_CONTENT_TYPES": ["text/html", "application/xhtml+xml", "application/xml", "text/xml"],
         "TWISTED_REACTOR": "twisted.internet.asyncioreactor.AsyncioSelectorReactor",
-        # Alt C: as fast as possible, polite via robots.txt + 429 backoff
-            "CONCURRENT_REQUESTS": 16,
-            "CONCURRENT_REQUESTS_PER_DOMAIN": 4,
-            "DOWNLOAD_DELAY": 0,
+        "CONCURRENT_REQUESTS": 16,
+        "CONCURRENT_REQUESTS_PER_DOMAIN": 4,
+        "DOWNLOAD_DELAY": 0,
         "AUTOTHROTTLE_ENABLED": True,
         "AUTOTHROTTLE_START_DELAY": 1.0,
         "AUTOTHROTTLE_MAX_DELAY": 10.0,
@@ -141,6 +140,8 @@ def spawn_spider_process(urls, netloc_keywords, path_keywords, skip_domains, pro
 
     # Create crawler from process
     spiderCrawler = process.create_crawler(HesitantSpider)
+    crawl_max_depth = int(CONFIG.crawl.get("max_depth", 2))
+    crawl_max_jumps = int(CONFIG.crawl.get("max_jumps", 1))
 
     # Crawl and configure spider
     # auto-tune sitemap cap: single domain 100k needs higher cap, multi-domain lower is fine
@@ -148,7 +149,8 @@ def spawn_spider_process(urls, netloc_keywords, path_keywords, skip_domains, pro
     process.crawl(
         spiderCrawler,
         start_urls=urls,
-        max_depth=2,
+        max_depth=crawl_max_depth,
+        max_jumps=crawl_max_jumps,
         target_netloc_keywords=netloc_keywords,
         target_path_keywords=path_keywords,
         skip_domains=skip_domains,
