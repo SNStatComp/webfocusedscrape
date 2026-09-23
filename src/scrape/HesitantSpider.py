@@ -113,6 +113,9 @@ class HesitantSpider(scrapy.Spider):
         if max_depth < 0:
             self.logger.debug("Only urls from starting_url can be found, max_depth < 0")
 
+        # For logging the (relevant) domains linked from each base-url
+        self.starturl_linkeddomains = {start_url: set() for start_url in start_urls}
+
     # Asynchronous function that starts the crawl
     async def start(self):
         self.start_time = time.time()
@@ -200,10 +203,7 @@ class HesitantSpider(scrapy.Spider):
 
     # Determine whether or not to skip URL
     def skip_this_url(self, url: str) -> bool:
-        """Function to see if we skip url"""
-
-        if url in self.visited:
-            return True
+        """Function to see if we skip url because it's undesired"""
 
         # Only visit valid urls
         if not validators.url(url):
@@ -229,12 +229,6 @@ class HesitantSpider(scrapy.Spider):
         if not any([url_netloc.endswith(toplevel_domain) for toplevel_domain in self.allowed_top_level_domains]):
             self.logger.debug(f"Skip {url} with netloc {url_netloc}, because top-level domain is not in allowed list")
             return True
-
-        # prevent duplicate crawl from trailing forward slash in URL
-        url = url.rstrip('/') if url.endswith('/') else url
-
-        # prevent duplicate crawl from '#' such as '#content', '#main', etc.
-        url = url.rstrip("#") if "#" in url else url
 
         # Skip domains on skip-list
         if any([skip_domain in url for skip_domain in self.skip_domains]):
@@ -271,6 +265,15 @@ class HesitantSpider(scrapy.Spider):
 
         return False
 
+    def already_visited(self, url: str) -> bool:
+        """Function to see if we skip url because we have seen it (but logging its domain is still relevant)"""
+
+        # prevent duplicate crawl from trailing forward slash in URL
+        url = url.rstrip('/') if url.endswith('/') else url
+        # prevent duplicate crawl from '#' such as '#content', '#main', etc.
+        url = url.rstrip("#") if "#" in url else url
+        return url in self.visited
+
     # Process request response
     async def parse(self, response):
         # Check if we passed timeout
@@ -280,6 +283,7 @@ class HesitantSpider(scrapy.Spider):
             raise CloseSpider('bandwidth_exceeded')
         current_depth = response.meta.get("depth", 0)
         steps_from_target = response.meta.get("steps_from_target", 0)
+        base_url = response.meta.get("base_url")
 
         # Check if url is target
         url_is_targeted, first_keyword_hit = self.url_is_target(response.url)
@@ -300,7 +304,7 @@ class HesitantSpider(scrapy.Spider):
 
         # If we exceed jumps, return
         if jumps > self.max_jumps:
-            self.logger.debug(f"Ending crawl path due to exceeding jumps ({jumps}/{self.max_jumps}) for {response.url}, base url: {response.meta.get("base_url")}")
+            self.logger.debug(f"Ending crawl path due to exceeding jumps ({jumps}/{self.max_jumps}) for {response.url}, base url: {base_url}")
             return
 
         # Process response if above skip-conditions not met
@@ -322,7 +326,7 @@ class HesitantSpider(scrapy.Spider):
                     callback=self.parse_sitemap,
                     errback=self.handle_error,
                     meta={
-                        "base_url": response.meta.get("base_url"),
+                        "base_url": base_url,
                         "current_start": f"{parsed_url.scheme}://{parsed_url.netloc}",
                         "depth": current_depth,
                         "steps_from_target": steps_from_target,
@@ -334,7 +338,21 @@ class HesitantSpider(scrapy.Spider):
         for link in response.css("a::attr(href)").getall():
             url = urljoin(response.url, link)
 
-            # Only continue with valid crawl paths
+            # log linked domain
+            parsed_url = urlparse(url)
+            
+            # Check if we have already seen the url
+            if self.already_visited(url):
+                # in that case log the domain anyway for assigning results to all relevant base_urls in analysis
+                url_domain = parsed_url.netloc.lower()
+                if url_domain not in self.starturl_linkeddomains[base_url]:
+                    self.starturl_linkeddomains[base_url].add(url_domain)
+                    self.logger.info(f"New entry (base url, linked domain): ({base_url}, {url_domain}), counter: {len(self.starturl_linkeddomains[base_url])}")
+
+                # skip parsing though!
+                continue
+
+            # If we havent seen it, only continue with valid crawl paths
             if self.skip_this_url(url):
                 continue
 
@@ -343,7 +361,7 @@ class HesitantSpider(scrapy.Spider):
                 callback=self.parse,
                 errback=self.handle_error,
                 meta={
-                    "base_url": response.meta.get("base_url"),
+                    "base_url": base_url,
                     "current_start": f"{parsed_url.scheme}://{parsed_url.netloc}",
                     "depth": current_depth + 1,
                     "steps_from_target": steps_from_target + 1,
@@ -389,7 +407,7 @@ class HesitantSpider(scrapy.Spider):
         for url in urls:
             url = normalize_url(url)
             # Only continue with valid crawl paths
-            if self.skip_this_url(url):
+            if self.skip_this_url(url) or self.already_visited(url):
                 continue
             parsed_url = urlparse(url)
 
