@@ -14,10 +14,12 @@ requests:
 input:
   input_dir: input
   input_files:
-    skip_domains: skipdomains.txt
+    skip_domains: skip_domains.txt
     urls: urls.txt
-    netloc_keywords: keywords.txt
-    path_keywords: keywords.txt
+    target_netloc_keywords: target_netloc_keywords.txt
+    target_path_keywords: target_path_keywords.txt
+    jump_netloc_keywords: jump_netloc_keywords.txt
+    jump_path_keywords: jump_path_keywords.txt
   url_max: 100
   url_offset: 0
   input_variables:
@@ -31,5 +33,6 @@ crawl:
   max_depth: 2
   max_jumps: 1
   use_sitemap: True
+  use_jump_whitelist: True
   schema:
     keyword:
