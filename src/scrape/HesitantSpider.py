@@ -49,6 +49,9 @@ class HesitantSpider(scrapy.Spider):
         start_urls: List[str],  # List of starting (base) urls
         target_netloc_keywords: List[str] = [], # List of keywords to determine targeting of URL netlocs
         target_path_keywords: List[str] = [],  # list of keywords to determine targeting of URL paths
+        jump_netloc_keywords: List[str] | None = None,  # whitelist keywords gating cross-site jumps (defaults to target_netloc_keywords)
+        jump_path_keywords: List[str] | None = None,  # whitelist keywords gating cross-site jumps (defaults to target_path_keywords)
+        use_jump_whitelist: bool = True,  # if True, only follow cross-site jumps whose url matches jump keywords
         max_depth: int = 2,  # Maximum non-target exploration steps
         skip_domains: List[str] = [],  # List of domains to skip
         skip_paths: List[str] = [],  # List of in-website paths to skip
@@ -84,6 +87,17 @@ class HesitantSpider(scrapy.Spider):
         self.logger.debug(f"Init target netloc keywords: {self.target_netloc_keywords}")
         self.target_path_keywords = target_path_keywords
         self.logger.debug(f"Init target paths keywords: {self.target_path_keywords}")
+        # Cross-site jump whitelist keywords default to the target keywords
+        if jump_netloc_keywords is None:
+            jump_netloc_keywords = target_netloc_keywords
+        if jump_path_keywords is None:
+            jump_path_keywords = target_path_keywords
+        self.jump_netloc_keywords = jump_netloc_keywords
+        self.logger.debug(f"Init jump netloc keywords: {self.jump_netloc_keywords}")
+        self.jump_path_keywords = jump_path_keywords
+        self.logger.debug(f"Init jump path keywords: {self.jump_path_keywords}")
+        self.use_jump_whitelist = use_jump_whitelist
+        self.logger.debug(f"Init use_jump_whitelist: {self.use_jump_whitelist}")
         self.batch_size = batch_size
         self.logger.debug(f"Init batch_size: {self.batch_size}")
         self.allowed_languages = allowed_languages
@@ -110,6 +124,8 @@ class HesitantSpider(scrapy.Spider):
         # Use IGNORECASE to catch OJA variants like /Vacatures/
         self._re_netloc = [re.compile(k, re.IGNORECASE) for k in (target_netloc_keywords or [])]
         self._re_path = [re.compile(k, re.IGNORECASE) for k in (target_path_keywords or [])]
+        self._re_jump_netloc = [re.compile(k, re.IGNORECASE) for k in (jump_netloc_keywords or [])]
+        self._re_jump_path = [re.compile(k, re.IGNORECASE) for k in (jump_path_keywords or [])]
         self._skip_domains_set = set(d.lower().strip() for d in (skip_domains or []) if d)
         self._skip_paths_set = set(p.strip().lower() for p in (skip_paths or []) if p)
         self._allowed_tld_set = tuple(t.lower() for t in (allowed_top_level_domains or []))
@@ -272,14 +288,14 @@ class HesitantSpider(scrapy.Spider):
         self.batch = []
         self.logger.debug(f"Saved batch to parquet, total results: {len(self.results)}")
 
-    # Determine whether or not URL is a target - uses pre-compiled regexes
-    def url_is_target(self, url: str):
+    # Determine whether or not URL matches a set of pre-compiled netloc/path keyword regexes
+    def url_matches_keywords(self, url: str, netloc_res, path_res):
         try:
             parsed_url = urlparse(url)
         except Exception:
             return False, None
         url_netloc = parsed_url.netloc or ""
-        for pat in self._re_netloc:
+        for pat in netloc_res:
             m = pat.search(url_netloc)
             if m:
                 # return original pattern string for first_keyword_hit
@@ -287,7 +303,7 @@ class HesitantSpider(scrapy.Spider):
                 return True, pat.pattern
 
         url_path = parsed_url.path or ""
-        for pat in self._re_path:
+        for pat in path_res:
             m = pat.search(url_path)
             if m:
                 self.logger.debug(f"For {url} keyword hit: {m.group(0)} (pat {pat.pattern})")
@@ -445,7 +461,7 @@ class HesitantSpider(scrapy.Spider):
 
         current_depth = int(response.meta.get("depth") or 0)
         steps_from_target = int(response.meta.get("steps_from_target") or 0)
-        url_is_targeted, first_keyword_hit = self.url_is_target(response.url)
+        url_is_targeted, first_keyword_hit = self.url_matches_keywords(response.url, self._re_netloc, self._re_path)
         if not url_is_targeted and steps_from_target >= self.max_depth:
             return
 
@@ -517,6 +533,14 @@ class HesitantSpider(scrapy.Spider):
             child_scope = self._scope(url, scope)
             if child_scope is None:
                 self.logger.debug(f"Skipping out-of-scope link: {url}")
+                continue
+            # Whitelist gate: only follow cross-site jumps whose url matches jump keywords
+            if (
+                self.use_jump_whitelist
+                and child_scope["jumps"] > scope["jumps"]
+                and not self.url_matches_keywords(url, self._re_jump_netloc, self._re_jump_path)[0]
+            ):
+                self.logger.debug(f"Skipping cross-site jump (no job keyword): {url}")
                 continue
             child_scope["depth"] = current_depth + 1
             child_scope["steps_from_target"] = 0 if url_is_targeted else steps_from_target + 1

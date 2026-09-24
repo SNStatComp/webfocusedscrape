@@ -48,7 +48,7 @@ def read_parquet_dir(parquet_dir):
 
 
 # Spawn spider crawler process
-def spawn_spider_process(urls, netloc_keywords, path_keywords, skip_domains, process_id, log_level, logfile, output_file, schema_keywords, jobdir=None, sitemap_max_urls=20000):
+def spawn_spider_process(urls, netloc_keywords, path_keywords, skip_domains, process_id, log_level, logfile, output_file, schema_keywords, jobdir=None, sitemap_max_urls=20000, jump_netloc_keywords=None, jump_path_keywords=None, use_jump_whitelist=True):
     # urls may be numpy array from np.array_split -> convert to list
     if not isinstance(urls, list):
         try:
@@ -153,6 +153,9 @@ def spawn_spider_process(urls, netloc_keywords, path_keywords, skip_domains, pro
         max_jumps=crawl_max_jumps,
         target_netloc_keywords=netloc_keywords,
         target_path_keywords=path_keywords,
+        jump_netloc_keywords=jump_netloc_keywords,
+        jump_path_keywords=jump_path_keywords,
+        use_jump_whitelist=use_jump_whitelist,
         skip_domains=skip_domains,
         output_file=output_file,
         allowed_top_level_domains=[".com", ".nl", ".ai", ".de", ".be", ".fr", ".eu", ".io", ".org"],
@@ -213,16 +216,28 @@ if __name__ == "__main__":
     # Normalize URLs
     urls = [*map(normalize_url, urls)]
 
-    # Keywords
-    file_keywords = f"{CONFIG.input.input_dir}/{CONFIG.input.input_files.netloc_keywords}"
-    logging.info(f"Reading list of keywords from file: {file_keywords}")
+    # Keywords (target: which pages get content saved)
+    file_keywords = f"{CONFIG.input.input_dir}/{CONFIG.input.input_files.target_netloc_keywords}"
+    logging.info(f"Reading list of target netloc keywords from file: {file_keywords}")
     with open(file_keywords, 'r', encoding='utf-8') as file_in:
         target_netloc_keywords = [line.rstrip() for line in file_in]
 
-    file_keywords = f"{CONFIG.input.input_dir}/{CONFIG.input.input_files.path_keywords}"
-    logging.info(f"Reading list of keywords from file: {file_keywords}")
+    file_keywords = f"{CONFIG.input.input_dir}/{CONFIG.input.input_files.target_path_keywords}"
+    logging.info(f"Reading list of target path keywords from file: {file_keywords}")
     with open(file_keywords, 'r', encoding='utf-8') as file_in:
         target_path_keywords = [line.rstrip() for line in file_in]
+
+    # Keywords (jump whitelist: which cross-site jumps are followed)
+    use_jump_whitelist = bool(CONFIG.crawl.get("use_jump_whitelist", True))
+    file_keywords = f"{CONFIG.input.input_dir}/{CONFIG.input.input_files.jump_netloc_keywords}"
+    logging.info(f"Reading list of jump netloc keywords from file: {file_keywords}")
+    with open(file_keywords, 'r', encoding='utf-8') as file_in:
+        jump_netloc_keywords = [line.rstrip() for line in file_in]
+
+    file_keywords = f"{CONFIG.input.input_dir}/{CONFIG.input.input_files.jump_path_keywords}"
+    logging.info(f"Reading list of jump path keywords from file: {file_keywords}")
+    with open(file_keywords, 'r', encoding='utf-8') as file_in:
+        jump_path_keywords = [line.rstrip() for line in file_in]
 
     # Skip domains
     file_skip_domains = f"{CONFIG.input.input_dir}/{CONFIG.input.input_files.skip_domains}"
@@ -274,9 +289,12 @@ if __name__ == "__main__":
                 logfile,
                 f"{CONFIG.output.output_dir}/{time_part}/worker_{i}.parquet",  # Different output files per worker
                 [CONFIG.crawl.schema.keyword],
-                jobdir,
-                50000 if enable_jobdir else 20000,  # higher sitemap cap for 100k single domain
-            )
+                 jobdir,
+                 50000 if enable_jobdir else 20000,  # higher sitemap cap for 100k single domain
+                 jump_netloc_keywords,
+                 jump_path_keywords,
+                 use_jump_whitelist,
+             )
         )
 
     print("# Workers:", num_workers)
