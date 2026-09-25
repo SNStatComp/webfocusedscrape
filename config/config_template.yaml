@@ -29,9 +29,11 @@ output:
   logs: logs
 crawl:
   max_duration: 500
-  max_visits: 200
   max_depth: 2
   max_jumps: 1
+  max_sitemap_depth: 1
+  sitemap_page_budget: 5000
+  allowed_countries: [nl]
   use_sitemap: True
   use_jump_whitelist: True
   schema:

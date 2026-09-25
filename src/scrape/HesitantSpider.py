@@ -17,6 +17,10 @@ from src.scrape.ScrapyResult import ScrapyResult
 from src.util import normalize_url
 
 _TLD_EXTRACT = tldextract.TLDExtract(suffix_list_urls=())
+# Country-code prefixes recognised in URL paths, derived from the bundled IANA
+# public-suffix list: its 2-character alphabetic entries are exactly the ccTLD set.
+# Used to tell a real country prefix (/de/, /fr/) from a short path segment (/p0/, /x2/).
+_CCTLD = frozenset(t for t in _TLD_EXTRACT.tlds if len(t) == 2 and t.isalpha())
 
 
 class HesitantSpider(scrapy.Spider):
@@ -61,10 +65,12 @@ class HesitantSpider(scrapy.Spider):
         max_jumps: int = 1,  # Maximum site-to-site jumps
         timeout: int = 3600,  # max time in seconds
         allowed_languages: List[str] = ["en", "en-us", "en-gb", "en-uk"],  # Allowed languages within url paths
-        allowed_countries: List[str] = ["en", "us", "gb", "eu"],  # Allowed countries within url paths
+        allowed_countries: List[str] = ["nl"],  # Allowed country prefixes within url paths (e.g. /nl/)
         schema_keywords: List[str] = [],  # Schema.org keywords to look for 
         sitemaps_tocheck: List[str] = ['sitemap.xml'],  # path extensions that often lead to sitemaps to check for URL's
         sitemap_max_urls: int = 20000,  # cap per sitemap to avoid 50k burst for 100k single domain
+        max_sitemap_depth: int = 1,  # how many levels of nested sitemaps to follow (0 = only base sitemap)
+        sitemap_page_budget: int = 5000,  # cap on cumulative sitemap-discovered page urls per base domain
         sitemap_batch_size: int = 1000,  # internal batch for logging only
         jobdir: str | None = None,  # Scrapy JOBDIR for resume (100k single domain)
         playwright_max_concurrent: int | None = None,  # None = auto (1 for single domain, 4 otherwise)
@@ -117,6 +123,10 @@ class HesitantSpider(scrapy.Spider):
         # Set timeout
         self.timeout = timeout
         self.sitemap_max_urls = sitemap_max_urls
+        self.max_sitemap_depth = max_sitemap_depth
+        self.logger.debug(f"Init max_sitemap_depth: {self.max_sitemap_depth}")
+        self.sitemap_page_budget = sitemap_page_budget
+        self.logger.debug(f"Init sitemap_page_budget: {self.sitemap_page_budget}")
         self.sitemap_batch_size = sitemap_batch_size
         self.jobdir = jobdir
 
@@ -158,12 +168,13 @@ class HesitantSpider(scrapy.Spider):
         self.batch = []
         self.results = []
         self.visited = set()
-        self.sitemaps_crawled = set()
+        # per-base-domain accounting for the sitemap page-url budget
+        self._sitemap_pages_used = {}
+        self._sitemap_budget_warned = set()
         # executor for offloading parquet writes (avoid blocking reactor)
         self._save_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="parquet-save")
         # buffer for visited persistence to avoid per-parse open/close (Alt C: batch 100)
         self._visited_buffer = []
-        self._sitemaps_buffer = []
 
         # JOBDIR resume: load visited if exists (100k single domain)
         if self.jobdir:
@@ -177,14 +188,6 @@ class HesitantSpider(scrapy.Spider):
                             if u:
                                 self.visited.add(u)
                     self.logger.info(f"Resumed {len(self.visited)} visited from {visited_file}")
-                # also load sitemaps_crawled
-                sitemap_file = os.path.join(self.jobdir, "sitemaps_crawled.txt")
-                if os.path.exists(sitemap_file):
-                    with open(sitemap_file, "r", encoding="utf-8") as f:
-                        for line in f:
-                            d = line.strip().lower()
-                            if d:
-                                self.sitemaps_crawled.add(d)
             except Exception as e:
                 self.logger.debug(f"JOBDIR load failed: {e}")
 
@@ -233,7 +236,6 @@ class HesitantSpider(scrapy.Spider):
         self.start_time = time.time()
         for start_url in self.start_urls:
             initial_meta = self._scope(start_url)
-            self.sitemaps_crawled.add(initial_meta["base_domain"])
             yield scrapy.Request(
                 url=start_url,
                 callback=self.parse,
@@ -246,7 +248,7 @@ class HesitantSpider(scrapy.Spider):
                     url=sitemap_url,
                     callback=self.parse_sitemap,
                     errback=self.handle_error,
-                    meta={**initial_meta, "sitemap": True},
+                    meta={**initial_meta, "sitemap": True, "sitemap_depth": 0},
                 )
 
     # Save current batch to disk - sync but batched larger (500) to amortize cost
@@ -390,10 +392,11 @@ class HesitantSpider(scrapy.Spider):
         # Path handling - split once
         # paths includes leading "" for /a/b
         paths = path.split("/") if path else []
-        # Skip if first path is a country code but not within allowed (e.g. /de/ )
+        # Skip if first path is a real country prefix but not within allowed (e.g. /de/ ).
+        # Only 2-char ccTLDs count as country prefixes, so short segments like /p0/ are not dropped.
         if self._allowed_countries_set and len(paths) >= 2:
             first = paths[1].lower()
-            if len(first) == 2 and first not in self._allowed_countries_set:
+            if first in _CCTLD and first not in self._allowed_countries_set:
                 return True
 
         # skip pre-defined paths - set intersection is O(n)
@@ -491,41 +494,6 @@ class HesitantSpider(scrapy.Spider):
                 except Exception:
                     pass
 
-        if response_domain == base_domain and base_domain not in self.sitemaps_crawled:
-            self.sitemaps_crawled.add(base_domain)
-            self.logger.debug(f"Checking base-domain sitemaps for {base_domain}")
-            if self.jobdir:
-                self._sitemaps_buffer.append(base_domain)
-                if len(self._sitemaps_buffer) >= 20:
-                    try:
-                        import os
-                        os.makedirs(self.jobdir, exist_ok=True)
-                        buf = self._sitemaps_buffer
-                        self._sitemaps_buffer = []
-                        def _flush_sitemap(b=buf, jd=self.jobdir):
-                            with open(os.path.join(jd, "sitemaps_crawled.txt"), "a", encoding="utf-8") as f:
-                                f.write("\n".join(b) + "\n")
-                        self._save_executor.submit(_flush_sitemap)
-                    except Exception:
-                        pass
-
-            parsed_url = urlparse(response.url)
-            for sitemap_path in self.sitemaps_tocheck:
-                sitemap_url = urljoin(f"{parsed_url.scheme}://{parsed_url.netloc}/", sitemap_path)
-                delay = self._get_crawl_delay(parsed_url.netloc)
-                delay_meta = {"download_delay": float(delay)} if delay and delay > 0 else {}
-                yield scrapy.Request(
-                    url=sitemap_url,
-                    callback=self.parse_sitemap,
-                    errback=self.handle_error,
-                    meta={
-                        **scope,
-                        "depth": current_depth,
-                        "steps_from_target": steps_from_target,
-                        **delay_meta,
-                    },
-                )
-
         for link in response.css("a::attr(href)").getall():
             url = urljoin(response.url, link)
             if self.skip_this_url(url):
@@ -569,6 +537,28 @@ class HesitantSpider(scrapy.Spider):
             if len(self.batch) >= self.batch_size:
                 self.save_batch()
 
+    def _register_download_delay(self, host: str, delay: float):
+        """Apply a robots crawl-delay to the live Scrapy downloader for this host.
+
+        Scrapy reads per-host delay from the download slot settings (keyed by hostname),
+        NOT from request.meta["download_delay"]. Mutating crawler settings at runtime is
+        not enough: the downloader snapshots DOWNLOAD_SLOTS into per_slot_settings at init
+        (scrapy/core/downloader/__init__.py). So write straight into that dict. The slot
+        for a host is created on its first request, so a delay registered before the first
+        request to that host takes effect; later changes only affect not-yet-created slots.
+        """
+        if not host or not delay or delay <= 0:
+            return
+        try:
+            downloader = self.crawler.engine.downloader
+            per_slot = downloader.per_slot_settings
+            slot = per_slot.setdefault(host, {})
+            if slot.get("delay") != delay:
+                slot["delay"] = float(delay)
+                self.logger.debug(f"Registered download delay {delay}s for host {host}")
+        except Exception as e:
+            self.logger.debug(f"Could not register download delay for {host}: {e}")
+
     def _get_crawl_delay(self, netloc: str) -> float | None:
         """Return crawl-delay for netloc from robots.txt, cached. Honors NSI politeness."""
         if not netloc:
@@ -578,7 +568,9 @@ class HesitantSpider(scrapy.Spider):
         if ":" in nl:
             nl = nl.split(":")[0]
         if nl in self._crawl_delay_cache:
-            return self._crawl_delay_cache[nl]
+            delay = self._crawl_delay_cache[nl]
+            self._register_download_delay(nl, delay)
+            return delay
         try:
             # use RobotsFetcher helper which handles crawl_delay + request_rate fallback
             delay = self._fetcher.robotsfetcher.get_crawl_delay(nl, self.settings.get("USER_AGENT") or "*")
@@ -588,11 +580,23 @@ class HesitantSpider(scrapy.Spider):
             self._crawl_delay_cache[nl] = delay
             if delay and delay > 0:
                 self.logger.info(f"Crawl-delay for {nl}: {delay}s (polite)")
+            self._register_download_delay(nl, delay)
             return delay
         except Exception as e:
             self.logger.debug(f"Crawl-delay fetch failed for {nl}: {e}")
             self._crawl_delay_cache[nl] = None
             return None
+
+    @staticmethod
+    def sitemap_scope_meta(scope, base_domain, response):
+        """Request meta for a url emitted from a sitemap (page or nested sitemap)."""
+        return {
+            **scope,
+            "branch_domain": base_domain,
+            "jumps": 0,
+            "steps_from_target": 0,
+            "depth": int(response.meta.get("depth") or 0) + 1,
+        }
 
     def parse_sitemap(self, response):
         scope = self._scope(response.url, response.meta)
@@ -620,37 +624,64 @@ class HesitantSpider(scrapy.Spider):
             self.logger.debug(f"Sitemap {response.url} yielded {len(urls)} urls")
 
         count = 0
+        sitemap_depth = int(response.meta.get("sitemap_depth") or 0)
+        pages_used = self._sitemap_pages_used.get(base_domain, 0)
+        budget_exhausted = self.sitemap_page_budget and pages_used >= self.sitemap_page_budget
+
         for url in urls:
             url = normalize_url(url)
             if self._site_domain(url) != base_domain or self.skip_this_url(url):
                 continue
 
-            sitemap_scope = {
-                **scope,
-                "branch_domain": base_domain,
-                "jumps": 0,
-                "steps_from_target": 0,
-                "depth": int(response.meta.get("depth") or 0) + 1,
-            }
-            parsed_url = urlparse(url)
-            delay = self._get_crawl_delay(parsed_url.netloc)
-            if delay and delay > 0:
-                sitemap_scope["download_delay"] = float(delay)
+            is_nested_sitemap = url.lower().endswith('.xml')
 
-            if url.lower().endswith('.xml'):
+            # Stop following a sitemap index once the page-url budget is spent
+            if budget_exhausted and is_nested_sitemap:
+                self.logger.debug(
+                    f"Sitemap page budget spent for {base_domain}; "
+                    f"not following nested sitemap: {url}"
+                )
+                continue
+
+            if is_nested_sitemap:
+                # Depth cap: only recurse while below max_sitemap_depth
+                if sitemap_depth >= self.max_sitemap_depth:
+                    self.logger.debug(
+                        f"Sitemap depth {sitemap_depth} reached max_sitemap_depth "
+                        f"{self.max_sitemap_depth}; skipping nested sitemap: {url}"
+                    )
+                    continue
+                nested_scope = {**self.sitemap_scope_meta(scope, base_domain, response), "sitemap_depth": sitemap_depth + 1}
                 yield scrapy.Request(
                     url=url,
                     callback=self.parse_sitemap,
                     errback=self.handle_error,
-                    meta=sitemap_scope,
+                    meta=nested_scope,
                 )
-            else:
-                yield scrapy.Request(
-                    url=url,
-                    callback=self.parse,
-                    errback=self.handle_error,
-                    meta=sitemap_scope,
-                )
+                count += 1
+                continue
+
+            # Page url: charge it against the per-base-domain budget
+            if self.sitemap_page_budget:
+                pages_used += 1
+                self._sitemap_pages_used[base_domain] = pages_used
+                if pages_used > self.sitemap_page_budget and base_domain not in self._sitemap_budget_warned:
+                    self._sitemap_budget_warned.add(base_domain)
+                    self.logger.warning(
+                        f"Sitemap page budget reached for {base_domain} "
+                        f"({self.sitemap_page_budget} urls, sitemap_page_budget); "
+                        f"skipping further sitemap urls for this domain"
+                    )
+                if pages_used > self.sitemap_page_budget:
+                    continue
+                budget_exhausted = pages_used >= self.sitemap_page_budget
+
+            yield scrapy.Request(
+                url=url,
+                callback=self.parse,
+                errback=self.handle_error,
+                meta=self.sitemap_scope_meta(scope, base_domain, response),
+            )
             count += 1
             if count % self.sitemap_batch_size == 0:
                 self.logger.debug(f"Sitemap {response.url}: enqueued {count} after filtering")
@@ -672,10 +703,6 @@ class HesitantSpider(scrapy.Spider):
                     with open(os.path.join(self.jobdir, "visited.txt"), "a", encoding="utf-8") as f:
                         f.write("\n".join(self._visited_buffer) + "\n")
                     self._visited_buffer = []
-                if self._sitemaps_buffer:
-                    with open(os.path.join(self.jobdir, "sitemaps_crawled.txt"), "a", encoding="utf-8") as f:
-                        f.write("\n".join(self._sitemaps_buffer) + "\n")
-                    self._sitemaps_buffer = []
             except Exception:
                 pass
         try:
