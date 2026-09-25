@@ -171,6 +171,8 @@ class HesitantSpider(scrapy.Spider):
         # per-base-domain accounting for the sitemap page-url budget
         self._sitemap_pages_used = {}
         self._sitemap_budget_warned = set()
+        # admitted off-base (job) domains whose own sitemap we have already probed
+        self._job_sitemaps_probed = set()
         # executor for offloading parquet writes (avoid blocking reactor)
         self._save_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="parquet-save")
         # buffer for visited persistence to avoid per-parse open/close (Alt C: batch 100)
@@ -462,6 +464,20 @@ class HesitantSpider(scrapy.Spider):
             )
             return
 
+        # Probe an admitted job (off-base) domain for its own sitemap. Many recruiting
+        # sites list vacancies only in their sitemap, not in crawlable links, so without
+        # this the vacancies are never discovered. Bounded: one probe per admitted domain.
+        if response_domain != base_domain and response_domain not in self._job_sitemaps_probed:
+            self._job_sitemaps_probed.add(response_domain)
+            parsed_host = urlparse(response.url)
+            for sitemap_path in self.sitemaps_tocheck:
+                yield scrapy.Request(
+                    url=urljoin(f"{parsed_host.scheme}://{parsed_host.netloc}/", sitemap_path),
+                    callback=self.parse_sitemap,
+                    errback=self.handle_error,
+                    meta={**scope, "sitemap_depth": 0},
+                )
+
         current_depth = int(response.meta.get("depth") or 0)
         steps_from_target = int(response.meta.get("steps_from_target") or 0)
         url_is_targeted, first_keyword_hit = self.url_matches_keywords(response.url, self._re_netloc, self._re_path)
@@ -588,11 +604,16 @@ class HesitantSpider(scrapy.Spider):
             return None
 
     @staticmethod
-    def sitemap_scope_meta(scope, base_domain, response):
-        """Request meta for a url emitted from a sitemap (page or nested sitemap)."""
+    def sitemap_scope_meta(scope, sitemap_domain, response):
+        """Request meta for a url emitted from a sitemap (page or nested sitemap).
+
+        A sitemap-discovered page is a fresh same-site starting point (jumps 0, depth
+        reset), so it is scoped to the sitemap's own domain. For the base domain that is
+        the seed domain; for an admitted job domain it keeps that branch.
+        """
         return {
             **scope,
-            "branch_domain": base_domain,
+            "branch_domain": sitemap_domain,
             "jumps": 0,
             "steps_from_target": 0,
             "depth": int(response.meta.get("depth") or 0) + 1,
@@ -602,10 +623,16 @@ class HesitantSpider(scrapy.Spider):
         scope = self._scope(response.url, response.meta)
         if scope is None:
             return
+        # The sitemap must belong to a domain we are allowed to crawl here: either the
+        # seed base domain, or an admitted off-base job domain. Scope its emitted urls to
+        # that same domain so a job sitemap can never widen the crawl elsewhere.
+        sitemap_domain = self._site_domain(response.url)
         base_domain = scope["base_domain"]
-        if self._site_domain(response.url) != base_domain:
+        if sitemap_domain not in {base_domain, scope.get("branch_domain")}:
             self.logger.debug(f"Skipping external sitemap: {response.url}")
             return
+        if sitemap_domain != base_domain:
+            scope = {**scope, "branch_domain": sitemap_domain}
 
         ns = {'ns': 'http://www.sitemaps.org/schemas/sitemap/0.9'}
         urls = response.xpath('//ns:url/ns:loc/text() | //ns:sitemap/ns:loc/text()', namespaces=ns).getall()
@@ -625,12 +652,12 @@ class HesitantSpider(scrapy.Spider):
 
         count = 0
         sitemap_depth = int(response.meta.get("sitemap_depth") or 0)
-        pages_used = self._sitemap_pages_used.get(base_domain, 0)
+        pages_used = self._sitemap_pages_used.get(sitemap_domain, 0)
         budget_exhausted = self.sitemap_page_budget and pages_used >= self.sitemap_page_budget
 
         for url in urls:
             url = normalize_url(url)
-            if self._site_domain(url) != base_domain or self.skip_this_url(url):
+            if self._site_domain(url) != sitemap_domain or self.skip_this_url(url):
                 continue
 
             is_nested_sitemap = url.lower().endswith('.xml')
@@ -638,7 +665,7 @@ class HesitantSpider(scrapy.Spider):
             # Stop following a sitemap index once the page-url budget is spent
             if budget_exhausted and is_nested_sitemap:
                 self.logger.debug(
-                    f"Sitemap page budget spent for {base_domain}; "
+                    f"Sitemap page budget spent for {sitemap_domain}; "
                     f"not following nested sitemap: {url}"
                 )
                 continue
@@ -651,7 +678,7 @@ class HesitantSpider(scrapy.Spider):
                         f"{self.max_sitemap_depth}; skipping nested sitemap: {url}"
                     )
                     continue
-                nested_scope = {**self.sitemap_scope_meta(scope, base_domain, response), "sitemap_depth": sitemap_depth + 1}
+                nested_scope = {**self.sitemap_scope_meta(scope, sitemap_domain, response), "sitemap_depth": sitemap_depth + 1}
                 yield scrapy.Request(
                     url=url,
                     callback=self.parse_sitemap,
@@ -661,14 +688,14 @@ class HesitantSpider(scrapy.Spider):
                 count += 1
                 continue
 
-            # Page url: charge it against the per-base-domain budget
+            # Page url: charge it against the per-domain budget
             if self.sitemap_page_budget:
                 pages_used += 1
-                self._sitemap_pages_used[base_domain] = pages_used
-                if pages_used > self.sitemap_page_budget and base_domain not in self._sitemap_budget_warned:
-                    self._sitemap_budget_warned.add(base_domain)
+                self._sitemap_pages_used[sitemap_domain] = pages_used
+                if pages_used > self.sitemap_page_budget and sitemap_domain not in self._sitemap_budget_warned:
+                    self._sitemap_budget_warned.add(sitemap_domain)
                     self.logger.warning(
-                        f"Sitemap page budget reached for {base_domain} "
+                        f"Sitemap page budget reached for {sitemap_domain} "
                         f"({self.sitemap_page_budget} urls, sitemap_page_budget); "
                         f"skipping further sitemap urls for this domain"
                     )
@@ -680,7 +707,7 @@ class HesitantSpider(scrapy.Spider):
                 url=url,
                 callback=self.parse,
                 errback=self.handle_error,
-                meta=self.sitemap_scope_meta(scope, base_domain, response),
+                meta=self.sitemap_scope_meta(scope, sitemap_domain, response),
             )
             count += 1
             if count % self.sitemap_batch_size == 0:
