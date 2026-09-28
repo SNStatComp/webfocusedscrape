@@ -50,6 +50,12 @@ coverage.xml
 .hypothesis/
 .pytest_cache/
 cover/
+*.dat
+
+# Images (plots)
+*.png
+*.jpg
+*.jpeg
 
 # Translations
 *.mo
