@@ -19,10 +19,10 @@ def is_valid_string(s):
 
 
 # Yields all .parquet frames in a dir (and its subdirs)
-def read_parquet_dir(parquet_dir):
+def read_parquet_dir(parquet_dir, exclude=()):
     for root, dirs, files in os.walk(parquet_dir):
         for file in files:
-            if file.endswith('.parquet'):
+            if file.endswith('.parquet') and file not in exclude:
                 file_path = os.path.join(root, file)
                 try:
                     df = pd.read_parquet(file_path)
