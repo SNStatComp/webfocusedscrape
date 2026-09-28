@@ -127,7 +127,7 @@ def spawn_spider_process(urls, netloc_keywords, path_keywords, skip_domains, pro
 
     # Crawl and configure spider
     # auto-tune sitemap cap: single domain needs higher cap, multi-domain lower is fine
-    # jobdir for resume when single domain
+    # jobdir comes from crawl.jobdir, one subdir per worker, None when unset
     process.crawl(
         spiderCrawler,
         start_urls=urls,
@@ -181,10 +181,32 @@ if __name__ == "__main__":
     # All workers write to same log
     logging_level = logging.DEBUG
 
-    dir_log = f"{CONFIG.output.output_dir}/{CONFIG.output.logs}"
-    if not os.path.exists(dir_log):
-        os.makedirs(dir_log)
-    logfile = f"{dir_log}/log_{datetime.now().strftime("%Y%m%d_%H%M%S")}.log"
+    # One timestamp for the whole run, used for logs and for per-run result filenames so
+    # the two cannot drift apart
+    time_part = datetime.now().strftime("%Y%m%d_%H%M%S")
+
+    # Resume state, one subdir per worker. Deliberately not under time_part, otherwise a
+    # new run would never see the previous run's visited state. Empty config = no resume.
+    jobdir_root = str(CONFIG.crawl.get("jobdir") or "").strip()
+
+    # Resolved once and used for both the batch-read exclusion and the write target; if
+    # those two ever disagree the aggregate gets re-read as a batch and doubles the rows
+    aggregate_name = str(CONFIG.output.get("aggregate") or "output_scrape.parquet").strip()
+
+    # With a jobdir, results and logs group under it so resumed runs accumulate in one
+    # place instead of stranding each run's pages in its own timestamped directory.
+    if jobdir_root:
+        dir_results = f"{jobdir_root}/output"
+        dir_log = f"{jobdir_root}/{CONFIG.output.logs}"
+    else:
+        dir_results = f"{CONFIG.output.output_dir}/{time_part}"
+        dir_log = f"{CONFIG.output.output_dir}/{CONFIG.output.logs}"
+
+    for d in (dir_results, dir_log):
+        if not os.path.exists(d):
+            os.makedirs(d)
+
+    logfile = f"{dir_log}/log_{time_part}.log"
     logging.basicConfig(
         filename=logfile,
         level=logging_level,
@@ -218,11 +240,6 @@ if __name__ == "__main__":
 
     chunked_args = []
 
-    # Make output dir for specific run
-    time_part = datetime.now().strftime("%Y%m%d_%H%M%S")
-    if not os.path.exists(f"{CONFIG.output.output_dir}/{time_part}"):
-        os.makedirs(f"{CONFIG.output.output_dir}/{time_part}")
-
     for i in range(0, num_workers):
         chunked_args.append(
             (
@@ -233,9 +250,11 @@ if __name__ == "__main__":
                 i,
                 logging_level,
                 logfile,
-                f"{CONFIG.output.output_dir}/{time_part}/worker_{i}.parquet",  # Different output files per worker
+                # time_part in the name keeps resumed runs from overwriting each other,
+                # since the spider restarts its batch counter at 0 every run
+                f"{dir_results}/{time_part}_worker_{i}.parquet",  # Different output files per worker
                 [CONFIG.crawl.schema.keyword],
-                None,
+                f"{jobdir_root}/worker_{i}" if jobdir_root else None,
                 20000,
                 jump_netloc_keywords,
                 jump_path_keywords,
@@ -252,9 +271,11 @@ if __name__ == "__main__":
 
     end_time = time.perf_counter()
 
-    # Results in tables
-    dir_parquets = f"{CONFIG.output.output_dir}/{time_part}/"
-    parquet_dfs = read_parquet_dir(dir_parquets)
+    # Results in tables. With a jobdir this reads every batch the crawl series has
+    # produced, so the aggregate covers prior runs too; without one it is this run only.
+    # The cumulative aggregate lives in this same dir, so it is excluded from the read,
+    # or its own rows would be counted again on the next run.
+    parquet_dfs = read_parquet_dir(dir_results, exclude=(aggregate_name,))
 
     # Analysis
     dfs = []
@@ -264,6 +285,14 @@ if __name__ == "__main__":
     if len(dfs) > 0:
         results = pd.concat(dfs, ignore_index=True)
         print("#Results:", len(results))
-        results.to_parquet(f"{CONFIG.output.output_dir}/output_scrape_{time_part}.parquet")
+        # Cumulative: rewritten each run from the full union, so it always reflects every
+        # run in this jobdir. Overwrite, not append.
+        if jobdir_root:
+            file_aggregate = f"{dir_results}/{aggregate_name}"
+        else:
+            # No jobdir: one aggregate per run, so the timestamp is part of the name
+            stem = os.path.splitext(aggregate_name)[0] or aggregate_name
+            file_aggregate = f"{CONFIG.output.output_dir}/{stem}_{time_part}.parquet"
+        results.to_parquet(file_aggregate)
 
     print("Runtime: ", end_time - start_time)

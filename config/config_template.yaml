@@ -25,6 +25,7 @@ output:
   output_dir: output
   batchsize: 500 # Rows per intermediary parquet batch file, combined at the end
   logs: logs
+  aggregate: output_scrape.parquet # Cumulative summary table, excluded from the batch read
 crawl:
   max_workers: 16
   max_duration: 500
@@ -35,5 +36,6 @@ crawl:
   allowed_countries: [nl]
   use_sitemap: True
   use_jump_whitelist: True
+  jobdir: # Resume state, one subdir per worker. Must persist between runs. Empty = no resume.
   schema:
     keyword:
