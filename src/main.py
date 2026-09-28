@@ -70,6 +70,10 @@ def spawn_spider_process(urls, netloc_keywords, path_keywords, skip_domains, pro
 
     # Per-worker wall-clock budget (crawl.max_duration, default 2 days) -> enforced as a hard stop
     crawl_timeout = int(CONFIG.crawl.get("max_duration", 3600 * 48))
+    # Defaults mirror HesitantSpider.custom_settings, which stays the fallback for standalone
+    # runs of the spider; keeping the same numbers there stops the two drifting apart
+    download_timeout = int(CONFIG.requests.get("timeout_read", 10))
+    retry_times = int(CONFIG.requests.get("max_retries", 2))
 
     # Tuned global settings - spider custom_settings provides same but CrawlerProcess wins if set here
     settings = {
@@ -89,8 +93,8 @@ def spawn_spider_process(urls, netloc_keywords, path_keywords, skip_domains, pro
         "AUTOTHROTTLE_START_DELAY": 1.0,
         "AUTOTHROTTLE_MAX_DELAY": 10.0,
         "AUTOTHROTTLE_TARGET_CONCURRENCY": 2.0,
-        "DOWNLOAD_TIMEOUT": 10,
-        "RETRY_TIMES": 2,
+        "DOWNLOAD_TIMEOUT": download_timeout,
+        "RETRY_TIMES": retry_times,
         "DNSCACHE_ENABLED": True,
         "DNSCACHE_SIZE": 10000,
         "REACTOR_THREADPOOL_MAXSIZE": 20,
@@ -148,6 +152,8 @@ def spawn_spider_process(urls, netloc_keywords, path_keywords, skip_domains, pro
     crawl_max_sitemap_depth = int(CONFIG.crawl.get("max_sitemap_depth", 1))
     crawl_sitemap_page_budget = int(CONFIG.crawl.get("sitemap_page_budget", 5000))
     crawl_allowed_countries = list(CONFIG.crawl.get("allowed_countries", ["nl"]))
+    # Rows per intermediary parquet batch; the batches are combined into the aggregate later
+    output_batch_size = int(CONFIG.output.get("batchsize", 500))
 
     # Crawl and configure spider
     # auto-tune sitemap cap: single domain 100k needs higher cap, multi-domain lower is fine
@@ -164,6 +170,7 @@ def spawn_spider_process(urls, netloc_keywords, path_keywords, skip_domains, pro
         use_jump_whitelist=use_jump_whitelist,
         skip_domains=skip_domains,
         output_file=output_file,
+        batch_size=output_batch_size,
         allowed_top_level_domains=[".com", ".nl", ".ai", ".de", ".be", ".fr", ".eu", ".io", ".org"],
         skip_paths=[
             "shop", "cart", "clients", "testimonials", "search",
@@ -257,7 +264,6 @@ if __name__ == "__main__":
     max_workers = 16
     num_workers = min([len(urls), max_workers])
     logging.info(f"Will use {num_workers} workers!")
-    batch_size = len(urls) // num_workers if len(urls) > num_workers else 1
     url_chunks = np.array_split(urls, num_workers)
 
     chunked_args = []

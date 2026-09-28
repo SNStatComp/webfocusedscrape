@@ -7,10 +7,8 @@ aws:
   session_token: 
   default_region: 
 requests:
-  useragent: Web-FOSS-NL-webfocusedscrape/0.1 (https://github.com/SNStatComp/webfocusedscrape)
-  timeout_connect: 3 # In seconds 
-  timeout_read: 7 # In seconds 
-  max_retries: 3
+  timeout_read: 10
+  max_retries: 2
 input:
   input_dir: input
   input_files:
@@ -25,9 +23,10 @@ input:
   input_variables:
 output:
   output_dir: output
-  batchsize: 100
+  batchsize: 500 # Rows per intermediary parquet batch file, combined at the end
   logs: logs
 crawl:
+  max_workers: 16
   max_duration: 500
   max_depth: 2
   max_jumps: 1
