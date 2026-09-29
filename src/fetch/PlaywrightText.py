@@ -1,17 +1,17 @@
 import asyncio
 import logging
-from typing import Tuple, Union
+from typing import Union
 
 from playwright.async_api import async_playwright, Error as PlaywrightError
 
 
 class PlaywrightTextFetcher:
     """
-    Playwright Text Fetcher - optimized for 100k-page statistical scraping.
+    Playwright Text Fetcher.
     Reuses single Browser/Context, pools Pages, blocks heavy resources,
-    adaptive wait instead of fixed 5s sleep.
+    Adaptive wait instead of fixed 5s sleep.
     """
-    # Resources to abort - saves ~30-40% bytes/time per page
+    # Resources to abort
     BLOCKED_RESOURCE_TYPES = {"image", "stylesheet", "font", "media"}
     BLOCKED_URL_SUFFIXES = (".png", ".jpg", ".jpeg", ".gif", ".webp", ".svg", ".woff", ".woff2", ".ttf", ".mp4", ".mp3")
 
@@ -24,7 +24,7 @@ class PlaywrightTextFetcher:
         logging.debug("Initializing PlaywrightTextFetcher (pooled)")
         self.user_agent = user_agent
         self.max_retries = max_retries
-        self.wait_time = wait_time  # now adaptive cap, not fixed sleep
+        self.wait_time = wait_time  # Adaptive cap, not fixed sleep
         self.max_concurrent_pages = max_concurrent_pages
         self._semaphore: asyncio.Semaphore | None = None
 
@@ -37,7 +37,7 @@ class PlaywrightTextFetcher:
         if self.setup_playwright:
             return
         self._playwright = await async_playwright().start()
-        # RAM is free -> keep one browser/worker, reuse context
+        # Keep one browser/worker, reuse context
         self._browser = await self._playwright.chromium.launch(
             headless=True,
             args=["--disable-dev-shm-usage", "--no-sandbox", "--disable-gpu", "--disable-extensions"]
@@ -130,7 +130,7 @@ class PlaywrightTextFetcher:
                     await page.wait_for_selector("body", timeout=3000)
                 except Exception:
                     pass
-                # minimal extra dwell for late XHR (price/OJA data)
+                # minimal extra dwell for late XMLHTTPRequest
                 await asyncio.sleep(min(self.wait_time, 1.0))
 
             text_content = await self._extract_clean_text(page)

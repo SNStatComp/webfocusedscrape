@@ -51,7 +51,6 @@ twisted==26.4.0
 typing-extensions==4.15.0
 ultimate-sitemap-parser==1.8.1
 urllib3==2.7.0
-validators==0.35.0
 w3lib==2.4.1
 wheel==0.47.0
 zope-interface==8.5
