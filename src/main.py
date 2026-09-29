@@ -49,9 +49,8 @@ def spawn_spider_process(urls, netloc_keywords, path_keywords, skip_domains, pro
         "DOWNLOADER_MIDDLEWARES": {
             "src.scrape.ScrapyCrawlMiddleware.TextTypeFilterMiddleware": 543
         },
-        "LOG_FILE": worker_logfile,
+        "LOG_ENABLED": False,
         "LOG_LEVEL": log_level,
-        "LOG_ENABLED": True,
         "DOWNLOAD_CONTENT_TYPES": ["text/html", "application/xhtml+xml", "application/xml", "text/xml"],
         "TWISTED_REACTOR": "twisted.internet.asyncioreactor.AsyncioSelectorReactor",
         "CONCURRENT_REQUESTS": 16,
