@@ -3,7 +3,6 @@ import logging
 from typing import Tuple, Union
 
 from playwright.async_api import async_playwright, Error as PlaywrightError
-from .Robots import RobotsFetcher
 
 
 class PlaywrightTextFetcher:
@@ -28,10 +27,6 @@ class PlaywrightTextFetcher:
         self.wait_time = wait_time  # now adaptive cap, not fixed sleep
         self.max_concurrent_pages = max_concurrent_pages
         self._semaphore: asyncio.Semaphore | None = None
-
-        # keep RobotsFetcher for future politeness checks but don't init eagerly
-        self.robotsfetcher = RobotsFetcher(user_agent=user_agent)
-        self._robots_bydomain = self.robotsfetcher.get_results()
 
         self.setup_playwright = False
         self._playwright = None

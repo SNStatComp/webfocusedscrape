@@ -9,7 +9,6 @@ import numpy as np
 import pandas as pd
 
 from datetime import datetime
-from urllib.parse import urlparse
 from scrapy.crawler import CrawlerProcess
 
 from src.scrape import HesitantSpider
@@ -69,6 +68,9 @@ def spawn_spider_process(urls, netloc_keywords, path_keywords, skip_domains, pro
     if project_root not in sys.path:
         sys.path.insert(0, project_root)
 
+    # Per-worker wall-clock budget (crawl.max_duration, default 2 days) -> enforced as a hard stop
+    crawl_timeout = int(CONFIG.crawl.get("max_duration", 3600 * 48))
+
     # Tuned global settings - spider custom_settings provides same but CrawlerProcess wins if set here
     settings = {
         "ROBOTSTXT_OBEY": True,
@@ -92,6 +94,7 @@ def spawn_spider_process(urls, netloc_keywords, path_keywords, skip_domains, pro
         "DNSCACHE_ENABLED": True,
         "DNSCACHE_SIZE": 10000,
         "REACTOR_THREADPOOL_MAXSIZE": 20,
+        "CLOSESPIDER_TIMEOUT": crawl_timeout,
     }
     if jobdir:
         settings["JOBDIR"] = jobdir
@@ -142,6 +145,9 @@ def spawn_spider_process(urls, netloc_keywords, path_keywords, skip_domains, pro
     spiderCrawler = process.create_crawler(HesitantSpider)
     crawl_max_depth = int(CONFIG.crawl.get("max_depth", 2))
     crawl_max_jumps = int(CONFIG.crawl.get("max_jumps", 1))
+    crawl_max_sitemap_depth = int(CONFIG.crawl.get("max_sitemap_depth", 1))
+    crawl_sitemap_page_budget = int(CONFIG.crawl.get("sitemap_page_budget", 5000))
+    crawl_allowed_countries = list(CONFIG.crawl.get("allowed_countries", ["nl"]))
 
     # Crawl and configure spider
     # auto-tune sitemap cap: single domain 100k needs higher cap, multi-domain lower is fine
@@ -168,10 +174,12 @@ def spawn_spider_process(urls, netloc_keywords, path_keywords, skip_domains, pro
             "downloads", "portfolio"
         ],
         allowed_languages=["nl", "en", "en-uk", "en-gb", "nl-nl", "en-nl", "nl-en"],
-        allowed_countries=["nl"],
+        allowed_countries=crawl_allowed_countries,
         schema_keywords=schema_keywords,
-        timeout=3600 * 48,  # 2 days
+        timeout=crawl_timeout,  # per-worker wall-clock budget (crawl.max_duration)
         sitemap_max_urls=sitemap_max_urls,
+        max_sitemap_depth=crawl_max_sitemap_depth,
+        sitemap_page_budget=crawl_sitemap_page_budget,
         jobdir=jobdir,
     )
 
@@ -259,25 +267,7 @@ if __name__ == "__main__":
     if not os.path.exists(f"{CONFIG.output.output_dir}/{time_part}"):
         os.makedirs(f"{CONFIG.output.output_dir}/{time_part}")
 
-    # Enable JOBDIR for 100k single-domain resume (1 domain many pages via sitemap)
-    # Multi-domain 100k seeds: many workers, jobdir per worker is heavy churn -> disable
-    try:
-        unique_domains = len(set([urlparse(u).netloc.lower() for u in urls if u]))
-    except Exception:
-        unique_domains = len(urls)
-    enable_jobdir = False
-    # Alt C: only enable JOBDIR for large single-domain crawls >5k pages (27h resume), not for 20 seeds 100s pages test
-    if unique_domains == 1:
-        try:
-            if CONFIG.crawl.max_visits and int(CONFIG.crawl.max_visits) > 5000:
-                enable_jobdir = True
-        except Exception:
-            pass
-        # also if single seed via sitemap likely large, but keep off for 20 seeds test
-        # fallback: keep disabled for small runs to avoid per-parse visited.txt overhead
-
     for i in range(0, num_workers):
-        jobdir = f"{CONFIG.output.output_dir}/{time_part}/jobdir_worker_{i}" if enable_jobdir else None
         chunked_args.append(
             (
                 url_chunks[i],
@@ -289,12 +279,12 @@ if __name__ == "__main__":
                 logfile,
                 f"{CONFIG.output.output_dir}/{time_part}/worker_{i}.parquet",  # Different output files per worker
                 [CONFIG.crawl.schema.keyword],
-                 jobdir,
-                 50000 if enable_jobdir else 20000,  # higher sitemap cap for 100k single domain
-                 jump_netloc_keywords,
-                 jump_path_keywords,
-                 use_jump_whitelist,
-             )
+                None,
+                20000,
+                jump_netloc_keywords,
+                jump_path_keywords,
+                use_jump_whitelist,
+            )
         )
 
     print("# Workers:", num_workers)
