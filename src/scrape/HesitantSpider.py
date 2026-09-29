@@ -33,8 +33,8 @@ class HesitantSpider(scrapy.Spider):
         "AUTOTHROTTLE_DEBUG": False,
         "CONCURRENT_REQUESTS": 16,
         "CONCURRENT_REQUESTS_PER_DOMAIN": 4,
-        "DOWNLOAD_DELAY": 0,               # AutoThrottle supplies the adaptive delay
-        "DOWNLOAD_TIMEOUT": 10,              # fail faster
+        "DOWNLOAD_DELAY": 0,  # AutoThrottle supplies the adaptive delay
+        "DOWNLOAD_TIMEOUT": 10,
         "RETRY_TIMES": 2,
         "RETRY_HTTP_CODES": [500, 502, 503, 504, 408, 429],
         "DNSCACHE_ENABLED": True,
@@ -49,8 +49,8 @@ class HesitantSpider(scrapy.Spider):
         start_urls: List[str],  # List of starting (base) urls
         target_netloc_keywords: List[str] = [],  # List of keywords to determine targeting of URL netlocs
         target_path_keywords: List[str] = [],  # list of keywords to determine targeting of URL paths
-        jump_netloc_keywords: List[str] | None = None,  # whitelist keywords gating cross-site jumps (defaults to target_netloc_keywords)
-        jump_path_keywords: List[str] | None = None,  # whitelist keywords gating cross-site jumps (defaults to target_path_keywords)
+        jump_netloc_keywords: List[str] = None,  # whitelist keywords gating cross-site jumps (defaults to target_netloc_keywords)
+        jump_path_keywords: List[str] = None,  # whitelist keywords gating cross-site jumps (defaults to target_path_keywords)
         use_jump_whitelist: bool = True,  # if True, only follow cross-site jumps whose url matches jump keywords
         max_depth: int = 2,  # Maximum non-target exploration steps
         skip_domains: List[str] = [],  # List of domains to skip
@@ -259,6 +259,7 @@ class HesitantSpider(scrapy.Spider):
             "content": [res.content for res in self.batch],
             "crawl_depth": [res.crawl_depth for res in self.batch],
             "schema_indicator": [res.schema_indicator for res in self.batch],
+            "follows_schema": [res.follows_schema for res in self.batch],
         })
 
         out = self.output_file.replace(".parquet", f"_{self.batch_counter}.parquet")
@@ -524,6 +525,8 @@ class HesitantSpider(scrapy.Spider):
         if url_is_targeted:
             self.logger.debug(f"Found targeted url: {response.url} from base url {scope['base_url']}")
             schema_indicator = bool(self._schemaparser.parse(response=response))
+            # Whether the site used schema.org at all, independent of the keyword config
+            follows_schema = self._schemaparser.has_structured_data(response=response)
             result = ScrapyResult(
                 base_url=str(scope["base_url"]),
                 url=response.url,
@@ -532,6 +535,7 @@ class HesitantSpider(scrapy.Spider):
                 content=await self._fetcher.fetch(response.url),
                 crawl_depth=current_depth,
                 schema_indicator=schema_indicator,
+                follows_schema=follows_schema,
                 timestamp=datetime.now().strftime("%Y-%m-%d-%H:%M:%S"),
             )
             self.batch.append(result)

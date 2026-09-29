@@ -24,6 +24,15 @@ class SchemaParser(ISchemaParser):
         self.schema_keywords = schema_keywords
         logging.info(f"Initializing SchemaParser to detect entities of any of types: {self.schema_keywords}")
 
+    def has_structured_data(self, response: Response) -> bool:
+        """
+        True if the page carries any application/ld+json block, whatever its @type.
+        Independent of schema_keywords: parse() answers "is one of the types I was asked
+        about present", this answers "did the site use schema.org at all".
+        """
+        jsonlds = response.xpath("//script[@type='application/ld+json']/text()").getall()
+        return any(block and block.strip() for block in jsonlds)
+
     def parse(self, response: Response) -> List[str]:
         """
         Returns the types that were found of the allowed type
