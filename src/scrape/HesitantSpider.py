@@ -17,6 +17,10 @@ from src.scrape.ScrapyResult import ScrapyResult
 from src.util import normalize_url
 
 _TLD_EXTRACT = tldextract.TLDExtract(suffix_list_urls=())
+# Country-code prefixes recognised in URL paths, derived from the bundled IANA
+# public-suffix list: its 2-character alphabetic entries are exactly the ccTLD set.
+# Used to tell a real country prefix (/de/, /fr/) from a short path segment (/p0/, /x2/).
+_CCTLD = frozenset(t for t in _TLD_EXTRACT.tlds if len(t) == 2 and t.isalpha())
 
 
 class HesitantSpider(scrapy.Spider):
@@ -363,10 +367,11 @@ class HesitantSpider(scrapy.Spider):
         # Path handling - split once
         # paths includes leading "" for /a/b
         paths = path.split("/") if path else []
-        # Skip if first path is a country code but not within allowed (e.g. /de/ )
+        # Skip if first path is a real country prefix but not within allowed (e.g. /de/ ).
+        # Only 2-char ccTLDs count as country prefixes, so short segments like /p0/ are not dropped.
         if self._allowed_countries_set and len(paths) >= 2:
             first = paths[1].lower()
-            if len(first) == 2 and first not in self._allowed_countries_set:
+            if first in _CCTLD and first not in self._allowed_countries_set:
                 return True
 
         # skip pre-defined paths - set intersection is O(n)
