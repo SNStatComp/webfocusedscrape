@@ -8,7 +8,7 @@ def normalize_url(url: str):
     - adds https scheme if missing
     - lowercases netloc
     - strips default ports and fragment (avoid dupe crawl #main vs #content)
-    - DOES NOT force www. (previous version broke apex domains)
+    - DOES NOT force www.
     :param url: url to normalize
     """
     if not url or not isinstance(url, str):
@@ -32,14 +32,13 @@ def normalize_url(url: str):
         scheme = "https"
 
     netloc = (parsed.netloc or "").lower().strip()
-    # strip userinfo? keep as is for now
+
     # strip default ports
     if netloc.endswith(":443") and scheme == "https":
         netloc = netloc[:-4]
     elif netloc.endswith(":80") and scheme == "http":
         netloc = netloc[:-3]
-    # also handle :443/:80 with explicit port parsing for hosts with www.
-    # don't add/remove www - keep as provided (lowercased)
+
     # remove trailing dot
     if netloc.endswith("."):
         netloc = netloc.rstrip(".")

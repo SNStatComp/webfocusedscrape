@@ -40,7 +40,7 @@ class HTMLBodyParser(IHTMLParser):
         if not html:
             return ""
         try:
-            # lxml is ~5x faster than html.parser and more lenient for 100k pages
+            # lxml is ~5x faster than html.parser and more lenient
             try:
                 soup = BeautifulSoup(html, "lxml")
             except Exception:

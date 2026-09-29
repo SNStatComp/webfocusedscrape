@@ -17,9 +17,7 @@ from src.scrape.ScrapyResult import ScrapyResult
 from src.util import normalize_url
 
 _TLD_EXTRACT = tldextract.TLDExtract(suffix_list_urls=())
-# Country-code prefixes recognised in URL paths, derived from the bundled IANA
-# public-suffix list: its 2-character alphabetic entries are exactly the ccTLD set.
-# Used to tell a real country prefix (/de/, /fr/) from a short path segment (/p0/, /x2/).
+# Country-code prefixes recognised in URL paths, Used to tell a real country prefix from a short path segment
 _CCTLD = frozenset(t for t in _TLD_EXTRACT.tlds if len(t) == 2 and t.isalpha())
 
 
@@ -36,7 +34,7 @@ class HesitantSpider(scrapy.Spider):
         "CONCURRENT_REQUESTS": 16,
         "CONCURRENT_REQUESTS_PER_DOMAIN": 4,
         "DOWNLOAD_DELAY": 0,               # AutoThrottle supplies the adaptive delay
-        "DOWNLOAD_TIMEOUT": 10,              # faster fail for 100k scale
+        "DOWNLOAD_TIMEOUT": 10,              # fail faster
         "RETRY_TIMES": 2,
         "RETRY_HTTP_CODES": [500, 502, 503, 504, 408, 429],
         "DNSCACHE_ENABLED": True,
@@ -49,7 +47,7 @@ class HesitantSpider(scrapy.Spider):
     def __init__(
         self,
         start_urls: List[str],  # List of starting (base) urls
-        target_netloc_keywords: List[str] = [], # List of keywords to determine targeting of URL netlocs
+        target_netloc_keywords: List[str] = [],  # List of keywords to determine targeting of URL netlocs
         target_path_keywords: List[str] = [],  # list of keywords to determine targeting of URL paths
         jump_netloc_keywords: List[str] | None = None,  # whitelist keywords gating cross-site jumps (defaults to target_netloc_keywords)
         jump_path_keywords: List[str] | None = None,  # whitelist keywords gating cross-site jumps (defaults to target_path_keywords)
@@ -58,7 +56,7 @@ class HesitantSpider(scrapy.Spider):
         skip_domains: List[str] = [],  # List of domains to skip
         skip_paths: List[str] = [],  # List of in-website paths to skip
         allowed_top_level_domains: List[str] = [".com"],  # List of allowed top level domains
-        batch_size: int = 500,  # Output batch size (500 good for 100k pages -> fewer parquet files)
+        batch_size: int = 500,  # Output batch size (fewer parquet files)
         output_file: str = "output.parquet",  # Output file name
         max_jumps: int = 1,  # Maximum site-to-site jumps
         timeout: int = 3600,  # max time in seconds
@@ -66,11 +64,11 @@ class HesitantSpider(scrapy.Spider):
         allowed_countries: List[str] = ["nl"],  # Allowed country prefixes within url paths (e.g. /nl/)
         schema_keywords: List[str] = [],  # Schema.org keywords to look for 
         sitemaps_tocheck: List[str] = ['sitemap.xml'],  # path extensions that often lead to sitemaps to check for URL's
-        sitemap_max_urls: int = 20000,  # cap per sitemap to avoid 50k burst for 100k single domain
+        sitemap_max_urls: int = 20000,  # cap per sitemap to avoid a large burst
         max_sitemap_depth: int = 1,  # how many levels of nested sitemaps to follow (0 = only base sitemap)
         sitemap_page_budget: int = 5000,  # cap on cumulative sitemap-discovered page urls per base domain
         sitemap_batch_size: int = 1000,  # internal batch for logging only
-        jobdir: str | None = None,  # Scrapy JOBDIR for resume (100k single domain)
+        jobdir: str | None = None,  # Scrapy JOBDIR for resume
         playwright_max_concurrent: int | None = None,  # None = auto (1 for single domain, 4 otherwise)
         *args, **kwargs
     ):
@@ -128,7 +126,7 @@ class HesitantSpider(scrapy.Spider):
         self.sitemap_batch_size = sitemap_batch_size
         self.jobdir = jobdir
 
-        # Pre-compile regexes and build sets for hot paths (called per link, 5-20M times at 100k scale)
+        # Pre-compile regexes and build sets for hot paths
         # Use IGNORECASE to catch OJA variants like /Vacatures/
         self._re_netloc = [re.compile(k, re.IGNORECASE) for k in (target_netloc_keywords or [])]
         self._re_path = [re.compile(k, re.IGNORECASE) for k in (target_path_keywords or [])]
@@ -171,7 +169,7 @@ class HesitantSpider(scrapy.Spider):
         # buffer for visited persistence to avoid per-parse open/close
         self._visited_buffer = []
 
-        # JOBDIR resume: load visited if exists (100k single domain)
+        # If jobdir was passed, load visited and continue run
         if self.jobdir:
             try:
                 import os
@@ -247,7 +245,7 @@ class HesitantSpider(scrapy.Spider):
                 )
 
     # Save current batch to disk - sync but batched larger (500) to amortize cost
-    # For 100k pages, small overhead is fine; offload if you want non-blocking
+    # Small overhead is fine; offload if you want non-blocking
     def save_batch(self):
         if len(self.batch) == 0:
             self.logger.debug("Tried to save batch without any results..")
@@ -295,7 +293,7 @@ class HesitantSpider(scrapy.Spider):
         for pat in netloc_res:
             m = pat.search(url_netloc)
             if m:
-                # return original pattern string for first_keyword_hit
+                # Return original pattern string for first_keyword_hit
                 self.logger.debug(f"For {url} keyword hit: {m.group(0)} (pat {pat.pattern})")
                 return True, pat.pattern
 
@@ -341,12 +339,12 @@ class HesitantSpider(scrapy.Spider):
         slash_idx = path.rfind("/")
         last_segment = path[slash_idx + 1:] if slash_idx != -1 else path
         if "." in last_segment:
-            # take suffix after last dot, lower
+            # Take suffix after last dot, lower
             ext = "." + last_segment.rsplit(".", 1)[-1].lower()
-            # strip query-like suffixes: e.g. ".jpg?size=1" not needed because path has no query
+            # Strip query-like suffixes: e.g. ".jpg?size=1" not needed because path has no query
             if ext in self._unsupported:
                 return True
-            # also handle ".jpg:large" edge
+            # Also handle ".jpg:large" edge
             if len(ext) > 6:  # truncated check for weird cases
                 ext_short = ext.split("?")[0].split(":")[0].split("#")[0]
                 if ext_short in self._unsupported:
@@ -354,7 +352,7 @@ class HesitantSpider(scrapy.Spider):
 
         # TLD check - use tuple endswith (fast)
         if self._allowed_tld_set:
-            # use endswith with tuple, already lowercased
+            # Use endswith with tuple, already lowercased
             if not url_netloc.endswith(self._allowed_tld_set):
                 return True
 
@@ -374,9 +372,9 @@ class HesitantSpider(scrapy.Spider):
             if first in _CCTLD and first not in self._allowed_countries_set:
                 return True
 
-        # skip pre-defined paths - set intersection is O(n)
+        # Skip pre-defined paths - set intersection is O(n)
         if self._skip_paths_set and paths:
-            # lower paths for case-insensitive
+            # Lower paths for case-insensitive
             # Use any() with set lookup (fast)
             for seg in paths:
                 if seg.lower() in self._skip_paths_set:
@@ -384,7 +382,7 @@ class HesitantSpider(scrapy.Spider):
 
         # Language query check - only if languages restricted and query exists
         if self._allowed_languages_set and parsed_url.query:
-            # parse_qs is more robust than split but slightly heavier; keep split for speed but handle case
+            # Parse_qs is more robust than split but slightly heavier; keep split for speed but handle case
             q = parsed_url.query.lower()
             # quick check before detailed parse
             if "lang=" in q or "language=" in q:
@@ -393,9 +391,9 @@ class HesitantSpider(scrapy.Spider):
                     for key in ("lang", "language"):
                         if key in qs:
                             for val in qs[key]:
-                                # val may contain e.g. "en-us" or "en"
+                                # Val may contain e.g. "en-us" or "en"
                                 v = val.split("-")[0] if "-" in val else val
-                                # also check full
+                                # Also check full
                                 if val not in self._allowed_languages_set and v not in self._allowed_languages_set:
                                     return True
                 except Exception:
@@ -658,7 +656,7 @@ class HesitantSpider(scrapy.Spider):
     # Called when the spider closes cleanly
     async def closed(self, reason):
         self.save_batch()
-        # flush visited/sitemap buffers if JOBDIR
+        # Flush visited/sitemap buffers if JOBDIR
         if self.jobdir:
             try:
                 import os

@@ -26,7 +26,7 @@ class SchemaParser(ISchemaParser):
 
     def parse(self, response: Response) -> List[str]:
         """
-        returns the types that were found of the allowed type
+        Returns the types that were found of the allowed type
         Handles @graph, lists, and @type being list or string.
         """
         if not self.schema_keywords:
