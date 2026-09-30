@@ -605,6 +605,23 @@ class HesitantSpider(scrapy.Spider):
         }
 
     def parse_sitemap(self, response):
+        """Sitemap callback registered on Scrapy Requests (see start() and parse()).
+
+        This is deliberately NOT a generator function - it contains no ``yield``
+        statement and simply returns the generator built by _parse_sitemap_impl.
+        Scrapy iterates a returned iterable exactly like yielded items, so crawl
+        behavior is identical.
+
+        WARNING for future editors: do NOT add ``yield``/``yield from`` to this
+        wrapper. That would make it a generator function again and re-expose the
+        crash. Put new sitemap logic in _parse_sitemap_impl.
+        """
+        return self._parse_sitemap_impl(response)
+
+    def _parse_sitemap_impl(self, response):
+        """Generator doing the actual sitemap work. Never register this directly
+        as a Scrapy callback - always go through parse_sitemap (see note there).
+        """
         scope = self._scope(response.url, response.meta)
         if scope is None:
             return
