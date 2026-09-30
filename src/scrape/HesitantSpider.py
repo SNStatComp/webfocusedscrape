@@ -316,15 +316,17 @@ class HesitantSpider(scrapy.Spider):
 
         return False, None
 
-    # Determine whether or not to skip URL - optimized for hot path
-    def skip_this_url(self, url: str) -> bool:
-        """Fast URL filter. Returns True if URL should be skipped."""
+    # Function to check if we've visited the url, seperated from skip_this_url for domain-logging
+    def already_visited(self, url: str) -> bool:
         # Fast visited check (exact + canonical fragment/trailing slash stripped)
         if url in self.visited:
             return True
         canon = url.split("#")[0].rstrip("/")
-        if canon != url and canon in self.visited:
-            return True
+        return canon != url and canon in self.visited
+
+    # Determine whether or not to skip URL - optimized for hot path
+    def skip_this_url(self, url: str) -> bool:
+        """Fast URL filter. Returns True if URL should be skipped."""
         if not url or len(url) < 8:  # minimal http://a.b
             return True
         if url.startswith(("mailto:", "javascript:", "tel:")):
@@ -493,6 +495,10 @@ class HesitantSpider(scrapy.Spider):
 
         for link in response.css("a::attr(href)").getall():
             url = urljoin(response.url, link)
+            
+            # if undesired, skip and don't log domain
+            if self.skip_this_url(url):
+                continue
 
             # Log the linked domain before any filtering, so that skipped and
             # already-seen links are still attributed to the base url.
@@ -507,8 +513,10 @@ class HesitantSpider(scrapy.Spider):
                         f"counter: {len(self.starturl_linkeddomains[base_url])}"
                     )
 
-            if self.skip_this_url(url):
+            # if vistied, we now have logged the domain, but can still skip (repeated) visit
+            if self.visited:
                 continue
+
             child_scope = self._scope(url, scope)
             if child_scope is None:
                 self.logger.debug(f"Skipping out-of-scope link: {url}")
