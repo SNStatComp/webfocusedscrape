@@ -62,6 +62,8 @@ def spawn_spider_process(urls, netloc_keywords, path_keywords, skip_domains, pro
         "AUTOTHROTTLE_TARGET_CONCURRENCY": 4.0,
         "DOWNLOAD_TIMEOUT": download_timeout,
         "RETRY_TIMES": retry_times,
+        "DOWNLOAD_MAXSIZE": 10485760,  # prevent large file download
+        "DOWNLOAD_WARNSIZE": 33554432,  # prevent large file download
         "DNSCACHE_ENABLED": True,
         "DNSCACHE_SIZE": 10000,
         "REACTOR_THREADPOOL_MAXSIZE": 20,

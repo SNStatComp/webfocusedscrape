@@ -45,6 +45,8 @@ class HesitantSpider(scrapy.Spider):
         "DOWNLOAD_DELAY": 0,  # AutoThrottle supplies the adaptive delay
         "DOWNLOAD_TIMEOUT": 10,
         "RETRY_TIMES": 2,
+        "DOWNLOAD_MAXSIZE": 10485760,
+        "DOWNLOAD_WARNSIZE": 33554432,
         "RETRY_HTTP_CODES": [500, 502, 503, 504, 408, 429],
         "DNSCACHE_ENABLED": True,
         "DNSCACHE_SIZE": 10000,
@@ -151,10 +153,10 @@ class HesitantSpider(scrapy.Spider):
         self._fetcher = PlaywrightTextFetcher(max_concurrent_pages=playwright_max_concurrent)
         self.logger.debug(f"Playwright max_concurrent_pages={playwright_max_concurrent} for {len(start_urls)} start_urls")
         self._unsupported = {
-            ".ics", ".mng", ".pct", ".bmp", ".gif", ".jpg", ".jpeg", ".png", ".pst", ".psp", ".tif", ".tiff", ".drw", ".dxf", ".eps",
-            ".woff2", ".svg", ".mp3", ".wma", ".ogg", ".wav", ".ra", ".aac", ".mid", ".aiff", ".3gp", ".asf", ".asx", ".avi", ".mp4",
-            ".woff", ".mpg", ".qt", ".rm", ".swf", ".wmv", ".m4a", ".css", ".pdf", ".doc", ".docx", ".exe", ".bin", ".rss", ".zip",
-            ".rar", ".msu", ".flv", ".dmg", ".xls", ".xlsx", ".ico"
+            ".ics", ".mng", ".pct", ".bmp", ".gif", ".jpg", ".jpeg", ".png", ".webp", ".avif", ".pst", ".psp", ".tif", ".tiff", ".drw", ".dxf", ".eps",
+            ".woff2", ".svg", ".mp3", ".wma", ".ogg", ".wav", ".ra", ".aac", ".mid", ".aiff", ".3gp", ".asf", ".asx", ".avi", ".mp4", ".webm", ".mov",
+            ".woff", ".mpg", ".qt", ".rm", ".swf", ".wmv", ".m4a", ".css", ".pdf", ".doc", ".docx", ".ppt", ".pptx", ".xls", ".xlsx", ".csv", ".exe", ".bin", ".rss", ".zip",
+            ".rar", ".7z", ".tar", ".gz", ".msu", ".flv", ".dmg", ".ico"
         }
         self.logger.info(f"URLs will be excluded if they contain any in path:{', '.join(self._unsupported)}")
 
@@ -347,22 +349,26 @@ class HesitantSpider(scrapy.Spider):
         if not url_netloc or not url_host:
             return True
 
-        # Extension check - last segment only, lowercased, with dot
+        # Extension check - last segment only, lowercased, with dot.
+        # Query/fragment carry binary names too (e.g. download_file.php?file=x.pdf),
+        # so check them as well without penalizing normal pages.
         path = parsed_url.path or ""
         # quick ext extraction without full split
         slash_idx = path.rfind("/")
         last_segment = path[slash_idx + 1:] if slash_idx != -1 else path
         if "." in last_segment:
-            # Take suffix after last dot, lower
-            ext = "." + last_segment.rsplit(".", 1)[-1].lower()
-            # Strip query-like suffixes: e.g. ".jpg?size=1" not needed because path has no query
+            # Take suffix after last dot, lower; strip :?# suffixes defensively
+            ext = "." + last_segment.rsplit(".", 1)[-1].lower().split("?")[0].split(":")[0].split("#")[0]
             if ext in self._unsupported:
                 return True
-            # Also handle ".jpg:large" edge
-            if len(ext) > 6:  # truncated check for weird cases
-                ext_short = ext.split("?")[0].split(":")[0].split("#")[0]
-                if ext_short in self._unsupported:
-                    return True
+        query = (parsed_url.query or "").lower()
+        if query and "." in query:
+            for token in query.replace(",", " ").replace(";", " ").split("&"):
+                token = token.split("=")[-1].split("?")[0].split("#")[0]
+                if "." in token:
+                    qext = "." + token.rsplit(".", 1)[-1].lower().split(":")[0][:8]
+                    if qext in self._unsupported:
+                        return True
 
         # TLD check - use tuple endswith (fast)
         if self._allowed_tld_set:
