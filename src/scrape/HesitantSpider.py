@@ -162,9 +162,10 @@ class HesitantSpider(scrapy.Spider):
         self._schemaparser = SchemaParser(schema_keywords=schema_keywords)
         self.logger.info(f"Init schemaparser with keywords: {schema_keywords}")
 
-        # Init batch, results, visited 
+        # Init batch, saved counter, visited
+        # No in-memory result retention: rows persist in parquet batches, so the spider never keeps unbounded content in RAM over a long (re)run
         self.batch = []
-        self.results = []
+        self.total_saved = 0
         self.visited = set()
         # For logging the (relevant) domains linked from each base-url
         self.starturl_linkeddomains = {start_url: set() for start_url in start_urls}
@@ -243,6 +244,7 @@ class HesitantSpider(scrapy.Spider):
                 callback=self.parse,
                 errback=self.handle_error,
                 meta=initial_meta,
+                dont_filter=True,
             )
             for sitemap_path in self.sitemaps_tocheck:
                 sitemap_url = urljoin(initial_meta["base_url"], sitemap_path)
@@ -251,6 +253,7 @@ class HesitantSpider(scrapy.Spider):
                     callback=self.parse_sitemap,
                     errback=self.handle_error,
                     meta={**initial_meta, "sitemap": True, "sitemap_depth": 0},
+                    dont_filter=True,
                 )
 
     # Save current batch to disk - sync but batched larger (500) to amortize cost
@@ -285,13 +288,11 @@ class HesitantSpider(scrapy.Spider):
                 self.logger.error(f"Fallback save also failed: {e2}")
 
         self.batch_counter += 1
-
-        # Add batch to total results
-        self.results += self.batch
+        self.total_saved += len(self.batch)
 
         # Empty batch
         self.batch = []
-        self.logger.debug(f"Saved batch to parquet, total results: {len(self.results)}")
+        self.logger.debug(f"Saved batch to parquet, total saved: {self.total_saved}")
 
     # Determine whether or not URL matches a set of pre-compiled netloc/path keyword regexes
     def url_matches_keywords(self, url: str, netloc_res, path_res):
@@ -696,8 +697,8 @@ class HesitantSpider(scrapy.Spider):
             self._save_executor.shutdown(wait=True)
         except Exception:
             pass
-        self.logger.info(f"Spider closed because of: {reason}. Total collected pages: {len(self.results)}")
-        print(f"Spider closed because of: {reason}. Total collected pages: {len(self.results)}")
+        self.logger.info(f"Spider closed because of: {reason}. Total saved pages: {self.total_saved}")
+        print(f"Spider closed because of: {reason}. Total saved pages: {self.total_saved}")
 
 
 if __name__ == "__main__":

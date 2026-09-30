@@ -17,16 +17,23 @@ class PlaywrightTextFetcher:
 
     def __init__(
             self,
-            user_agent: str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+            user_agent: str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/120.0.0.0",
             max_retries=2,
             wait_time=1.5,
-            max_concurrent_pages: int = 4):
+            max_concurrent_pages: int = 4,
+            max_fetches_per_context: int = 1000):
         logging.debug("Initializing PlaywrightTextFetcher (pooled)")
         self.user_agent = user_agent
         self.max_retries = max_retries
         self.wait_time = wait_time  # Adaptive cap, not fixed sleep
         self.max_concurrent_pages = max_concurrent_pages
+        # Recycle browser+context after this many fetches: a single long-lived context
+        # accumulates per-domain caches/state and its memory grows monotonically
+        self.max_fetches_per_context = max_fetches_per_context
         self._semaphore: asyncio.Semaphore | None = None
+        self._fetch_count = 0
+        self._inflight = 0
+        self._recycle_lock = asyncio.Lock()
 
         self.setup_playwright = False
         self._playwright = None
@@ -89,6 +96,24 @@ class PlaywrightTextFetcher:
         self.setup_playwright = False
         logging.info("Playwright browser closed.")
 
+    async def _maybe_recycle(self):
+        """Swap in a fresh browser+context once a context has served
+        max_fetches_per_context fetches, so per-domain state cannot accumulate
+        without bound over a long run."""
+        if self.max_fetches_per_context is None or self._fetch_count < self.max_fetches_per_context:
+            return
+        async with self._recycle_lock:
+            if self._fetch_count < self.max_fetches_per_context:
+                return
+            # Wait for in-flight pages to close before swapping the context
+            while self._inflight > 0:
+                await asyncio.sleep(0.2)
+            logging.info(f"Recycling Playwright context after {self._fetch_count} fetches")
+            await self.close()
+            self._fetch_count = 0
+            await self.setup_playwright_browser()
+            logging.info("Playwright context recycled")
+
     async def fetch(self, url: str) -> Union[str, dict]:
         """
         Asynchronous fetch using pooled Playwright.
@@ -106,7 +131,14 @@ class PlaywrightTextFetcher:
             # fallback without semaphore if setup partially failed
             return await self._fetch_with_retries(url)
         async with self._semaphore:
-            return await self._fetch_with_retries(url)
+            await self._maybe_recycle()
+            self._inflight += 1
+            try:
+                result = await self._fetch_with_retries(url)
+            finally:
+                self._inflight -= 1
+            self._fetch_count += 1
+            return result
 
     def get_results(self):
         # kept for backwards compat; Playwright fetcher is stateless (not caching by url)

@@ -170,15 +170,15 @@ def spawn_spider_process(urls, netloc_keywords, path_keywords, skip_domains, pro
         print(f"Something went from starting process! Error {e}")
 
     if spiderCrawler.spider is not None:
-        print(f"Returning results of length for PID {process_id} ({len(urls)} URLs: {urls}): {len(spiderCrawler.spider.results)} ({len(spiderCrawler.spider.visited)} visited)")
-    return spiderCrawler.spider.results
+        print(f"Returning results of length for PID {process_id} ({len(urls)} URLs: {urls}): {spiderCrawler.spider.total_saved} ({len(spiderCrawler.spider.visited)} visited)")
+    return spiderCrawler.spider.total_saved
 
 
 if __name__ == "__main__":
 
     # Set logging level and create file
     # All workers write to same log
-    logging_level = logging.DEBUG
+    logging_level = logging.INFO
 
     # One timestamp for the whole run, used for logs and for per-run result filenames so
     # the two cannot drift apart
