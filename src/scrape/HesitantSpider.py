@@ -21,6 +21,15 @@ _TLD_EXTRACT = tldextract.TLDExtract(suffix_list_urls=())
 _CCTLD = frozenset(t for t in _TLD_EXTRACT.tlds if len(t) == 2 and t.isalpha())
 
 
+def _brand_label(entry: str) -> str:
+    """Registrable-domain label for a skip entry, so one entry covers a brand
+    across TLDs (linkedin.com also blocks linkedin.nl / linkedin.be)."""
+    e = entry.lower().strip()
+    if not e:
+        return ""
+    return _TLD_EXTRACT(e if "." in e else f"//{e}").domain or e
+
+
 class HesitantSpider(scrapy.Spider):
     name = "hesitant-spider"
 
@@ -69,7 +78,7 @@ class HesitantSpider(scrapy.Spider):
         sitemap_page_budget: int = 5000,  # cap on cumulative sitemap-discovered page urls per base domain
         sitemap_batch_size: int = 1000,  # internal batch for logging only
         jobdir: str | None = None,  # Scrapy JOBDIR for resume
-        playwright_max_concurrent: int | None = None,  # None = auto (1 for single domain, 4 otherwise)
+        playwright_max_concurrent: int | None = None,  # None = default below
         *args, **kwargs
     ):
         super(HesitantSpider, self).__init__(*args, **kwargs)
@@ -132,13 +141,13 @@ class HesitantSpider(scrapy.Spider):
         self._re_path = [re.compile(k, re.IGNORECASE) for k in (target_path_keywords or [])]
         self._re_jump_netloc = [re.compile(k, re.IGNORECASE) for k in (jump_netloc_keywords or [])]
         self._re_jump_path = [re.compile(k, re.IGNORECASE) for k in (jump_path_keywords or [])]
-        self._skip_domains_set = set(d.lower().strip() for d in (skip_domains or []) if d)
+        self._skip_brands_set = {b for b in (_brand_label(d) for d in (skip_domains or [])) if b}
         self._skip_paths_set = set(p.strip().lower() for p in (skip_paths or []) if p)
         self._allowed_tld_set = tuple(t.lower() for t in (allowed_top_level_domains or []))
         self._allowed_countries_set = set(c.lower() for c in (allowed_countries or []))
         self._allowed_languages_set = set(l.lower() for l in (allowed_languages or []))
         if playwright_max_concurrent is None:
-            playwright_max_concurrent = 4
+            playwright_max_concurrent = 6
         self._fetcher = PlaywrightTextFetcher(max_concurrent_pages=playwright_max_concurrent)
         self.logger.debug(f"Playwright max_concurrent_pages={playwright_max_concurrent} for {len(start_urls)} start_urls")
         self._unsupported = {
@@ -331,7 +340,8 @@ class HesitantSpider(scrapy.Spider):
             return True
 
         url_netloc = (parsed_url.netloc or "").lower()
-        if not url_netloc:
+        url_host = (parsed_url.hostname or "").lower()
+        if not url_netloc or not url_host:
             return True
 
         # Extension check - last segment only, lowercased, with dot
@@ -357,11 +367,10 @@ class HesitantSpider(scrapy.Spider):
             if not url_netloc.endswith(self._allowed_tld_set):
                 return True
 
-        # Skip domains - precise: netloc equals or ends with .skip_domain
-        if self._skip_domains_set:
-            for sd in self._skip_domains_set:
-                if url_netloc == sd or url_netloc.endswith("." + sd) or sd in url_netloc:
-                    return True
+        # Skip domains: match the registrable-domain label, so an entry blocks the brand on
+        # any TLD. hostname rather than netloc, so an explicit port cannot defeat the match.
+        if self._skip_brands_set and _TLD_EXTRACT(url_host).domain in self._skip_brands_set:
+            return True
 
         # Path handling - split once
         # paths includes leading "" for /a/b
