@@ -20,6 +20,13 @@ _TLD_EXTRACT = tldextract.TLDExtract(suffix_list_urls=())
 # Country-code prefixes recognised in URL paths, Used to tell a real country prefix from a short path segment
 _CCTLD = frozenset(t for t in _TLD_EXTRACT.tlds if len(t) == 2 and t.isalpha())
 
+# On-site search endpoint query keys. URLs carrying one of these keys are skipped
+# outright in skip_this_url (see note there): search spaces are effectively
+# infinite, never match JobPosting target keywords, and hammer small hosts into
+# HTTP 429 rate-limits. Keys are matched exactly against lowercased query keys,
+# so /faq paths or ?lang= params are unaffected.
+_SEARCH_QUERY_KEYS = frozenset({"q", "s", "search", "searchterm", "query", "zoek", "zoeken", "zoekterm"})
+
 
 def _brand_label(entry: str) -> str:
     """Registrable-domain label for a skip entry, so one entry covers a brand
@@ -425,6 +432,19 @@ class HesitantSpider(scrapy.Spider):
                         elif pl.startswith("language="):
                             if pl[9:] not in self._allowed_languages_set:
                                 return True
+
+        # Search-query check - unconditional, independent of the language lists above.
+        # to prevent near-infinite URL space. Matching is on the query *key*
+        # (exact, lowercased) rather than substring, so a path like /faq is safe
+        # and only ?q=/ ?s= / ?search= / ?query= / ?zoek= / ?zoeken= / ?searchterm=
+        # style endpoints are skipped.
+        if parsed_url.query:
+            try:
+                qs_keys = set(parse_qs(parsed_url.query.lower(), keep_blank_values=True))
+            except Exception:
+                qs_keys = set()
+            if qs_keys & _SEARCH_QUERY_KEYS:
+                return True
 
         return False
 
