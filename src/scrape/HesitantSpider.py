@@ -514,7 +514,7 @@ class HesitantSpider(scrapy.Spider):
                     )
 
             # if vistied, we now have logged the domain, but can still skip (repeated) visit
-            if self.visited:
+            if self.already_visited(url):
                 continue
 
             child_scope = self._scope(url, scope)
