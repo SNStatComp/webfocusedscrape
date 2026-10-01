@@ -20,6 +20,13 @@ _TLD_EXTRACT = tldextract.TLDExtract(suffix_list_urls=())
 # Country-code prefixes recognised in URL paths, Used to tell a real country prefix from a short path segment
 _CCTLD = frozenset(t for t in _TLD_EXTRACT.tlds if len(t) == 2 and t.isalpha())
 
+# On-site search endpoint query keys. URLs carrying one of these keys are skipped
+# outright in skip_this_url (see note there): search spaces are effectively
+# infinite, never match JobPosting target keywords, and hammer small hosts into
+# HTTP 429 rate-limits. Keys are matched exactly against lowercased query keys,
+# so /faq paths or ?lang= params are unaffected.
+_SEARCH_QUERY_KEYS = frozenset({"q", "s", "search", "searchterm", "query", "zoek", "zoeken", "zoekterm"})
+
 
 def _brand_label(entry: str) -> str:
     """Registrable-domain label for a skip entry, so one entry covers a brand
@@ -41,13 +48,15 @@ class HesitantSpider(scrapy.Spider):
         "AUTOTHROTTLE_TARGET_CONCURRENCY": 2.0,
         "AUTOTHROTTLE_DEBUG": False,
         "CONCURRENT_REQUESTS": 16,
-        "CONCURRENT_REQUESTS_PER_DOMAIN": 4,
+        # Keep in sync with src/main.py: polite per-domain ceiling so standalone
+        # runs (this block) behave like pooled workers. See note in main.py.
+        "CONCURRENT_REQUESTS_PER_DOMAIN": 2,
         "DOWNLOAD_DELAY": 0,  # AutoThrottle supplies the adaptive delay
         "DOWNLOAD_TIMEOUT": 10,
         "RETRY_TIMES": 2,
         "DOWNLOAD_MAXSIZE": 10485760,
         "DOWNLOAD_WARNSIZE": 33554432,
-        "RETRY_HTTP_CODES": [500, 502, 503, 504, 408, 429],
+        "RETRY_HTTP_CODES": [500, 502, 503, 504, 408],
         "DNSCACHE_ENABLED": True,
         "DNSCACHE_SIZE": 10000,
         "REACTOR_THREADPOOL_MAXSIZE": 20,
@@ -426,6 +435,19 @@ class HesitantSpider(scrapy.Spider):
                             if pl[9:] not in self._allowed_languages_set:
                                 return True
 
+        # Search-query check - unconditional, independent of the language lists above.
+        # to prevent near-infinite URL space. Matching is on the query *key*
+        # (exact, lowercased) rather than substring, so a path like /faq is safe
+        # and only ?q=/ ?s= / ?search= / ?query= / ?zoek= / ?zoeken= / ?searchterm=
+        # style endpoints are skipped.
+        if parsed_url.query:
+            try:
+                qs_keys = set(parse_qs(parsed_url.query.lower(), keep_blank_values=True))
+            except Exception:
+                qs_keys = set()
+            if qs_keys & _SEARCH_QUERY_KEYS:
+                return True
+
         return False
 
     # Process request response
@@ -583,6 +605,23 @@ class HesitantSpider(scrapy.Spider):
         }
 
     def parse_sitemap(self, response):
+        """Sitemap callback registered on Scrapy Requests (see start() and parse()).
+
+        This is deliberately NOT a generator function - it contains no ``yield``
+        statement and simply returns the generator built by _parse_sitemap_impl.
+        Scrapy iterates a returned iterable exactly like yielded items, so crawl
+        behavior is identical.
+
+        WARNING for future editors: do NOT add ``yield``/``yield from`` to this
+        wrapper. That would make it a generator function again and re-expose the
+        crash. Put new sitemap logic in _parse_sitemap_impl.
+        """
+        return self._parse_sitemap_impl(response)
+
+    def _parse_sitemap_impl(self, response):
+        """Generator doing the actual sitemap work. Never register this directly
+        as a Scrapy callback - always go through parse_sitemap (see note there).
+        """
         scope = self._scope(response.url, response.meta)
         if scope is None:
             return
