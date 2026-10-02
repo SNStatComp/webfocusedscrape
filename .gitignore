@@ -30,7 +30,7 @@ MANIFEST
 *.state
 *.json
 *.seen
-*q00000
+requests.queue/
 
 # PyInstaller
 #  Usually these files are written by a python script from a template

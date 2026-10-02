@@ -303,7 +303,7 @@ class HesitantSpider(scrapy.Spider):
 
         # Empty batch
         self.batch = []
-        self.logger.debug(f"Saved batch to parquet, total saved: {self.total_saved}")
+        self.logger.info(f"Saved batch to parquet, total saved: {self.total_saved}")
 
     # Determine whether or not URL matches a set of pre-compiled netloc/path keyword regexes
     def url_matches_keywords(self, url: str, netloc_res, path_res):

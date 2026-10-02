@@ -21,7 +21,8 @@ class PlaywrightTextFetcher:
             max_retries=2,
             wait_time=1.5,
             max_concurrent_pages: int = 4,
-            max_fetches_per_context: int = 1000):
+            max_fetches_per_context: int = 1000,
+            close_timeout: int = 10):
         logging.debug("Initializing PlaywrightTextFetcher (pooled)")
         self.user_agent = user_agent
         self.max_retries = max_retries
@@ -30,6 +31,11 @@ class PlaywrightTextFetcher:
         # Recycle browser+context after this many fetches: a single long-lived context
         # accumulates per-domain caches/state and its memory grows monotonically
         self.max_fetches_per_context = max_fetches_per_context
+        # Cap each teardown step so a wedged Playwright close cannot block the reactor
+        # indefinitely (it previously left workers hung for hours at shutdown)
+        self.close_timeout = close_timeout
+        # Created once here, never on recycle: rebuilding it mid-flight would strand
+        # every coroutine already inside `async with self._semaphore`
         self._semaphore: asyncio.Semaphore | None = None
         self._fetch_count = 0
         self._inflight = 0
@@ -41,8 +47,18 @@ class PlaywrightTextFetcher:
         self._context = None
 
     async def setup_playwright_browser(self):
-        if self.setup_playwright:
-            return
+        """Lock-safe entry point. asyncio.Lock is not reentrant (a second acquire
+        deadlocks), so callers that already hold _recycle_lock must use
+        _launch_browser directly."""
+        async with self._recycle_lock:
+            if self.setup_playwright:
+                return
+            await self._launch_browser()
+
+    async def _launch_browser(self):
+        """Start playwright + browser + context. Never call this while other
+        coroutines may be starting up concurrently; go through
+        setup_playwright_browser unless _recycle_lock is already held."""
         self._playwright = await async_playwright().start()
         # Keep one browser/worker, reuse context
         self._browser = await self._playwright.chromium.launch(
@@ -56,7 +72,10 @@ class PlaywrightTextFetcher:
         )
         # Block heavy resources at context level
         await self._context.route("**/*", self._route_handler)
-        self._semaphore = asyncio.Semaphore(self.max_concurrent_pages)
+        # Only created once: a recycle must not swap the semaphore out from under
+        # coroutines that are inside `async with self._semaphore`
+        if self._semaphore is None:
+            self._semaphore = asyncio.Semaphore(self.max_concurrent_pages)
         self.setup_playwright = True
         logging.info("Playwright browser+context pooled (%d concurrent pages)", self.max_concurrent_pages)
 
@@ -73,26 +92,28 @@ class PlaywrightTextFetcher:
         except Exception:
             pass
 
+    async def _close_step(self, what, factory):
+        """Run one teardown step under a timeout. A hung Playwright close never
+        raises, so an unbounded await here blocks the reactor forever; bound it so
+        shutdown always advances to the next resource."""
+        try:
+            await asyncio.wait_for(factory(), timeout=self.close_timeout)
+        except asyncio.TimeoutError:
+            logging.warning(f"Playwright {what} close timed out after {self.close_timeout}s; continuing")
+        except Exception:
+            pass
+
     async def close(self):
         """Properly shuts down the browser and playwright."""
-        try:
-            if self._context:
-                await self._context.close()
-                self._context = None
-        except Exception:
-            pass
-        try:
-            if self._browser:
-                await self._browser.close()
-                self._browser = None
-        except Exception:
-            pass
-        try:
-            if self._playwright:
-                await self._playwright.stop()
-                self._playwright = None
-        except Exception:
-            pass
+        if self._context:
+            context, self._context = self._context, None
+            await self._close_step("context", context.close)
+        if self._browser:
+            browser, self._browser = self._browser, None
+            await self._close_step("browser", browser.close)
+        if self._playwright:
+            playwright, self._playwright = self._playwright, None
+            await self._close_step("playwright", playwright.stop)
         self.setup_playwright = False
         logging.info("Playwright browser closed.")
 
@@ -105,13 +126,16 @@ class PlaywrightTextFetcher:
         async with self._recycle_lock:
             if self._fetch_count < self.max_fetches_per_context:
                 return
-            # Wait for in-flight pages to close before swapping the context
+            # Wait for in-flight pages to close before swapping the context. Called
+            # with no semaphore slot held, so the wait can actually reach zero.
             while self._inflight > 0:
                 await asyncio.sleep(0.2)
             logging.info(f"Recycling Playwright context after {self._fetch_count} fetches")
             await self.close()
             self._fetch_count = 0
-            await self.setup_playwright_browser()
+            # _recycle_lock is held here and is not reentrant, so bypass the
+            # locking wrapper and launch directly
+            await self._launch_browser()
             logging.info("Playwright context recycled")
 
     async def fetch(self, url: str) -> Union[str, dict]:
@@ -126,12 +150,16 @@ class PlaywrightTextFetcher:
             except Exception as e:
                 logging.error(f"Playwright setup failed for {url}: {e}")
                 return ""
+        # Recycle outside the semaphore. Holding a slot while waiting for
+        # _inflight to drain starves itself: freed slots get refilled by fetches
+        # that block on this same semaphore, so the recycle never runs and the
+        # interrupted close() leaks a playwright driver per cycle.
+        await self._maybe_recycle()
         # semaphore limits concurrent pages -> backpressure to Scrapy
         if self._semaphore is None:
             # fallback without semaphore if setup partially failed
             return await self._fetch_with_retries(url)
         async with self._semaphore:
-            await self._maybe_recycle()
             self._inflight += 1
             try:
                 result = await self._fetch_with_retries(url)
