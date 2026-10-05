@@ -1,3 +1,4 @@
+import asyncio
 import logging
 import re
 import time
@@ -292,12 +293,12 @@ class HesitantSpider(scrapy.Spider):
 
         out = self.output_file.replace(".parquet", f"_{self.batch_counter}.parquet")
         try:
-            # Offload to thread to not block Twisted reactor
             future = self._save_executor.submit(lambda d=df, o=out: d.to_parquet(o))
-            future.result()  # wait, but in thread; keeps ordering. For fully async use add_done_callback.
+            future.result(timeout=120)
+        except TimeoutError as e:
+            self.logger.error(f"Timed out saving batch {self.batch_counter} to {out}: {e}")
         except Exception as e:
             self.logger.error(f"Failed to save batch {self.batch_counter} to {out}: {e}")
-            # fallback sync
             try:
                 df.to_parquet(out)
             except Exception as e2:
@@ -737,7 +738,10 @@ class HesitantSpider(scrapy.Spider):
 
     # Called when the spider closes cleanly
     async def closed(self, reason):
-        self.save_batch()
+        try:
+            self.save_batch()
+        except Exception as e:
+            self.logger.debug(f"Error in final save_batch: {e}")
         # Flush visited/sitemap buffers if JOBDIR
         if self.jobdir:
             try:
@@ -750,11 +754,13 @@ class HesitantSpider(scrapy.Spider):
             except Exception:
                 pass
         try:
-            await self._fetcher.close()
+            await asyncio.wait_for(self._fetcher.close(), timeout=60)
+        except asyncio.TimeoutError:
+            self.logger.warning("Playwright close timed out; continuing shutdown")
         except Exception as e:
             self.logger.debug(f"Error closing fetcher: {e}")
         try:
-            self._save_executor.shutdown(wait=True)
+            self._save_executor.shutdown(wait=False, cancel_futures=True)
         except Exception:
             pass
         self.logger.info(f"Spider closed because of: {reason}. Total saved pages: {self.total_saved}")
