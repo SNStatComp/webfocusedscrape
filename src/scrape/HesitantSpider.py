@@ -244,6 +244,11 @@ class HesitantSpider(scrapy.Spider):
                 return None
             branch_domain, jumps = domain, 1
         return {**meta, "base_domain": base_domain, "branch_domain": branch_domain, "jumps": jumps}
+    
+    # closing function for clean and quick shutdown after timeout
+    def _closing(self) -> bool:
+        engine = getattr(getattr(self, "crawler", None), "engine", None)
+        return bool(engine is not None and getattr(engine, "closing", False))
 
     # Asynchronous function that starts the crawl
     async def start(self):
@@ -461,6 +466,8 @@ class HesitantSpider(scrapy.Spider):
         if scope is None:
             self.logger.debug(f"Skipping out-of-scope response: {response.url}")
             return
+        if self._closing():
+            return
         response_domain = self._site_domain(response.url)
         base_domain = scope["base_domain"]
         branch_domain = scope["branch_domain"]
@@ -483,6 +490,8 @@ class HesitantSpider(scrapy.Spider):
             self._job_sitemaps_probed.add(response_domain)
             parsed_host = urlparse(response.url)
             for sitemap_path in self.sitemaps_tocheck:
+                if self._closing():
+                    return
                 yield scrapy.Request(
                     url=urljoin(f"{parsed_host.scheme}://{parsed_host.netloc}/", sitemap_path),
                     callback=self.parse_sitemap,
@@ -560,6 +569,8 @@ class HesitantSpider(scrapy.Spider):
                 continue
             child_scope["depth"] = current_depth + 1
             child_scope["steps_from_target"] = 0 if url_is_targeted else steps_from_target + 1
+            if self._closing():
+                return
             yield scrapy.Request(
                 url=url,
                 callback=self.parse,
@@ -625,6 +636,8 @@ class HesitantSpider(scrapy.Spider):
         scope = self._scope(response.url, response.meta)
         if scope is None:
             return
+        if self._closing():
+            return
         # The sitemap must belong to a domain we are allowed to crawl here: either the
         # seed base domain, or an admitted off-base job domain. Scope its emitted urls to
         # that same domain so a job sitemap can never widen the crawl elsewhere.
@@ -662,6 +675,8 @@ class HesitantSpider(scrapy.Spider):
             if self._site_domain(url) != sitemap_domain or self.skip_this_url(url):
                 continue
 
+            if self._closing():
+                return
             is_nested_sitemap = url.lower().endswith('.xml')
 
             # Stop following a sitemap index once the page-url budget is spent
