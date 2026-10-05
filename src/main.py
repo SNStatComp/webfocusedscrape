@@ -267,8 +267,35 @@ if __name__ == "__main__":
 
     start_time = time.perf_counter()
 
-    with multiprocessing.Pool(processes=num_workers) as pool:
-        pool.starmap(spawn_spider_process, chunked_args)
+    # Per-worker wall-clock budget plus shutdown grace. Each worker is joined
+    # against the shared deadline and terminated individually, so one hung
+    # spider cannot veto the aggregate for all finished workers.
+    crawl_timeout = int(CONFIG.crawl.get("max_duration", 3600))
+    shutdown_grace = 900
+    deadline = start_time + crawl_timeout + shutdown_grace
+
+    processes = []
+    for args in chunked_args:
+        proc = multiprocessing.Process(target=spawn_spider_process, args=args)
+        proc.start()
+        processes.append(proc)
+    try:
+        for proc in processes:
+            remaining = deadline - time.perf_counter()
+            proc.join(timeout=max(0.0, remaining))
+            if proc.is_alive():
+                logging.warning(f"Worker PID {proc.pid} exceeded budget; terminating")
+                print(f"Worker PID {proc.pid} exceeded budget; terminating")
+                proc.terminate()
+                proc.join(timeout=60)
+                if proc.is_alive():
+                    proc.kill()
+                    proc.join(timeout=30)
+    except KeyboardInterrupt:
+        for proc in processes:
+            if proc.is_alive():
+                proc.terminate()
+        raise
 
     end_time = time.perf_counter()
 
