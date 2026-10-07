@@ -55,9 +55,9 @@ _SEARCH_QUERY_KEYS = frozenset({
 # from p1), `zoeken` 7,224, `q` 4,136 (mostly ?q= with an EMPTY value, a vestigial
 # form field rather than a search). Name-based facet blocking cannot distinguish
 # those from a genuine enumerator, so facet volume is now handled by
-# _note_signature, which tests whether a fetch surfaced a new OJA link instead of
+# _note_signature, which tests whether a fetch surfaced a new target detail link instead of
 # guessing from a key's spelling. That removed 81.8% of query-param fetches with
-# zero OJA detail pages lost.
+# zero target detail pages lost.
 
 # PHP/JS array-style query keys arrive subscripted: ?f[0]=x&f[1]=y, ?_vtype[2]=z,
 # ?tx_solr[filter][11]=q. parse_qs hands those back as literal names, so an exact
@@ -216,7 +216,7 @@ class HesitantSpider(scrapy.Spider):
         self.logger.info(f"Init facet_barren_guard: {self.facet_barren_guard}")
 
         # Pre-compile regexes and build sets for hot paths
-        # Use IGNORECASE to catch OJA variants like /Vacatures/
+        # Use IGNORECASE to catch target variants like /Vacatures/
         self._re_netloc = [re.compile(k, re.IGNORECASE) for k in (target_netloc_keywords or [])]
         self._re_path = [re.compile(k, re.IGNORECASE) for k in (target_path_keywords or [])]
         self._re_jump_netloc = [re.compile(k, re.IGNORECASE) for k in (jump_netloc_keywords or [])]
@@ -257,23 +257,23 @@ class HesitantSpider(scrapy.Spider):
         # Faceted sites expose one listing under an unlimited number of
         # permutations of that signature; per-job query urls sit on a signature that
         # keeps pointing at ids we have not seen. Both look identical in the URL, so
-        # the only honest discriminator is whether a fetch surfaced an OJA link this
+        # the only honest discriminator is whether a fetch surfaced a target detail link this
         # domain did not already hold - which is what we care about anyway.
         #
         # A signature is suppressed after `facet_barren_guard` consecutive fetches
-        # that yielded no new OJA link, and only if it has NEVER yielded one. That
+        # that yielded no new target detail link, and only if it has NEVER yielded one. That
         # proviso is what makes it lossless: replaying the 2054-seed corpus showed
-        # 9,845 OJA detail pages lost without it and 0 with it, while 81.8% of
+        # 9,845 target detail pages lost without it and 0 with it, while 81.8% of
         # query-param fetches became unnecessary.
         #
         # Keyed by registered domain, not base_url, because 67.6% of rows arrive via
         # cross-site jumps onto shared ATS platforms - the same listing reached from
         # two employers is one page, and per-base scoping would re-fetch it twice.
-        self._meat: dict[str, set[str]] = defaultdict(set)
+        self._target_details: dict[str, set[str]] = defaultdict(set)
         self._sig_barren: dict[tuple, int] = defaultdict(int)
         self._sig_productive: set[tuple] = set()
         self._sig_dead: set[tuple] = set()
-        # Signatures that produced OJA links and later went barren. Routine, not an
+        # Signatures that produced target detail links and later went barren. Routine, not an
         # anomaly: a listing whose jobs all fit on one page is productive on page 1
         # and barren on page 2. They are never suppressed, so this is a count of
         # how much of the frontier is held open on earlier links, not a loss signal.
@@ -466,7 +466,7 @@ class HesitantSpider(scrapy.Spider):
             return None
         return (domain, parsed.path, keys)
 
-    def _is_oja_detail(self, url: str) -> bool:
+    def _is_target_detail(self, url: str) -> bool:
         """True for a page describing one vacancy, not a listing.
 
         A listing root like /vacatures matches the target keywords but enumerates
@@ -481,34 +481,47 @@ class HesitantSpider(scrapy.Spider):
             return False
         return len(segments) >= 2
 
-    def _note_signature(self, url: str, links) -> None:
+    def _note_signature(self, url: str, links, is_job_page: bool = False) -> None:
         """Account one fetched query-param url against its signature.
 
-        Suppresses only signatures that have never surfaced an OJA link. That proviso
+        Suppresses only signatures that have never surfaced a target detail link. That proviso
         is the whole safety argument: a facet enumeration re-lists links we already
         hold and never trips it, while a per-job query url keeps producing fresh ids
         and stays crawlable.
+
+        is_job_page marks a page that itself carries JobPosting schema. Such a page
+        that also surfaced no recognized detail link is a query-style detail page
+        (its sibling job urls are depth-1 query urls the link check cannot see), not
+        a facet: credit its own url so its signature stays crawlable.
         """
         sig = self._signature(url)
         if sig is None:
             return
         domain = sig[0]
 
-        new_meat = 0
+        new_details = 0
+        recognized = 0
         for link in links:
             absolute = urljoin(url, link)
-            if not self._is_oja_detail(absolute):
+            if not self._is_target_detail(absolute):
                 continue
+            recognized += 1
             canonical = absolute.split("#")[0]
-            if canonical not in self._meat[domain]:
-                self._meat[domain].add(canonical)
-                new_meat += 1
+            if canonical not in self._target_details[domain]:
+                self._target_details[domain].add(canonical)
+                new_details += 1
 
-        if new_meat:
+        if is_job_page and recognized == 0:
+            canonical = url.split("#")[0]
+            if canonical not in self._target_details[domain]:
+                self._target_details[domain].add(canonical)
+                new_details += 1
+
+        if new_details:
             self._sig_productive.add(sig)
             self._sig_barren[sig] = 0
             self.logger.debug(
-                f"Signature {sig} surfaced {new_meat} new OJA links for {domain}; staying active"
+                f"Signature {sig} surfaced {new_details} new target detail links for {domain}; staying active"
             )
             return
 
@@ -520,7 +533,7 @@ class HesitantSpider(scrapy.Spider):
             return
 
         if sig in self._sig_productive:
-            # Never suppress a signature that has produced OJA links. Reaching here is
+            # Never suppress a signature that has produced target detail links. Reaching here is
             # routine, not anomalous: a listing whose jobs all fit on one page is
             # productive on page 1 and barren on page 2. Hence debug, and counted only
             # so the close-time summary shows how much of the frontier is held open on
@@ -529,7 +542,7 @@ class HesitantSpider(scrapy.Spider):
                 self._sig_starved.add(sig)
                 self.logger.debug(
                     f"Facet suppression declined for {sig} on {domain}; "
-                    f"signature previously yielded OJA links"
+                    f"signature previously yielded target detail links"
                 )
             return
 
@@ -537,7 +550,7 @@ class HesitantSpider(scrapy.Spider):
         self._sig_suppressed_total += 1
         self.logger.info(
             f"Facet signature suppressed: {domain} {sig[1]} keys={sorted(sig[2])}; "
-            f"{self._sig_barren[sig]} fetches yielded no new OJA link "
+            f"{self._sig_barren[sig]} fetches yielded no new target detail link "
             f"(facet_barren_guard={self.facet_barren_guard})"
         )
 
@@ -797,17 +810,15 @@ class HesitantSpider(scrapy.Spider):
                 dont_filter=False,
             )
 
-        # Account this page's OJA links against its query-param signature. Runs after
-        # the link loop because that loop already parsed the hrefs, so this costs no
-        # extra work over the response.
-        if url_is_targeted and links:
-            self._note_signature(response.url, links)
-
         if url_is_targeted:
             self.logger.debug(f"Found targeted url: {response.url} from base url {scope['base_url']}")
             schema_indicator = bool(self._schemaparser.parse(response=response))
             # Whether the site used schema.org at all, independent of the keyword config
             follows_schema = self._schemaparser.has_structured_data(response=response)
+            # Account this page against its query-param signature. Runs after the link
+            # loop because that loop already parsed the hrefs, so this costs no extra
+            # work over the response. schema_indicator doubles as the is_job_page signal.
+            self._note_signature(response.url, links, is_job_page=schema_indicator)
             content = await self._fetcher.fetch(response.url)
             # Write-time dedup: a base_url contributes each distinct document once.
             # The fetch already happened, so this trades nothing for coverage - it
@@ -961,6 +972,14 @@ class HesitantSpider(scrapy.Spider):
                 count += 1
                 continue
 
+            # Facet suppression: never enqueue a page url on a signature already
+            # proven barren. Mirrors the gate in parse()'s link loop; without it, facet
+            # urls discovered via sitemap bypass suppression entirely.
+            sig = self._signature(url)
+            if sig is not None and sig in self._sig_dead:
+                self._urls_avoided += 1
+                continue
+
             # Page url: charge it against the per-domain budget
             if self.sitemap_page_budget:
                 pages_used += 1
@@ -1021,7 +1040,7 @@ class HesitantSpider(scrapy.Spider):
         self.logger.info(
             f"Facet suppression: {self._sig_suppressed_total} signatures dead, "
             f"{self._urls_avoided} urls avoided, "
-            f"{len(self._sig_productive)} signatures stayed active on OJA links, "
+            f"{len(self._sig_productive)} signatures stayed active on target detail links, "
             f"{len(self._sig_starved)} productive signatures still crawlable"
         )
         self.logger.info(f"Spider closed because of: {reason}. Total saved pages: {self.total_saved}")

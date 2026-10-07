@@ -7,7 +7,7 @@ Listing and query-permutation pages are acceptable fat; unbounded facet
 enumeration is not.
 
 ## State
-Implemented and verified offline. NOT yet A/B-tested live. Nothing pushed.
+Implemented and verified offline. NOT yet A/B-tested live. Committed and pushed (bcdb640).
 Branch: temp_handoff (base 76f955b = origin/main).
 
 ## What is implemented
@@ -22,9 +22,21 @@ Branch: temp_handoff (base 76f955b = origin/main).
   new OJA link, AND ONLY IF the signature has never yielded one. That proviso is
   the entire safety argument: loss is zero by construction.
 - Link-loop gate :755 -> dead signatures never enqueue (the queue-size fix).
-- State: `_meat` (per registered domain), `_sig_barren`, `_sig_productive`,
+- State: `_target_details` (per registered domain), `_sig_barren`, `_sig_productive`,
   `_sig_dead`, `_sig_starved`.
 - Config key: `crawl.facet_barren_guard: 2`.
+
+### 1a. Sitemap dead-sig gate — HesitantSpider.py `_parse_sitemap_impl`
+Page urls discovered via sitemap are gated on `_sig_dead`, mirroring the link-loop
+gate in `parse()`. Without it, facet urls discovered via sitemap bypass suppression
+entirely. Nested sitemap recursion is unaffected (bounded by `max_sitemap_depth`).
+
+### 1b. Query-style detail pages protected — HesitantSpider.py `_note_signature`
+A targeted page that carries JobPosting schema and surfaces no recognized detail link
+is a query-style detail page (e.g. `/direct-solliciteren?vacature=594`), not a facet:
+its signature is credited with its own url so it is never suppressed. Content-based
+(schema), not name-based — consistent with the safety argument above. Requires
+`crawl.schema.keyword: JobPosting`; without it the guard is inert (no behavior change).
 
 ### 2. Query-key blocklist narrowed — HesitantSpider.py:42
 Kept: search family `q s search searchterm query zoek zoeken zoekterm`, plus four
