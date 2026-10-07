@@ -11,7 +11,7 @@ from datetime import datetime
 from scrapy.crawler import CrawlerProcess
 
 from src.scrape import HesitantSpider
-from src.util import setup, normalize_url, read_parquet_dir, read_input_file
+from src.util import drop_duplicate_rows, setup, normalize_url, read_parquet_dir, read_input_file
 
 CONFIG = setup("config/config.yaml")
 
@@ -122,6 +122,7 @@ def spawn_spider_process(urls, netloc_keywords, path_keywords, skip_domains, pro
     crawl_max_jumps = int(CONFIG.crawl.get("max_jumps", 1))
     crawl_max_sitemap_depth = int(CONFIG.crawl.get("max_sitemap_depth", 1))
     crawl_sitemap_page_budget = int(CONFIG.crawl.get("sitemap_page_budget", 5000))
+    crawl_facet_barren_guard = int(CONFIG.crawl.get("facet_barren_guard", 2))
     crawl_allowed_countries = list(CONFIG.crawl.get("allowed_countries", ["nl"]))
     # Rows per intermediary parquet batch; the batches are combined into the aggregate later
     output_batch_size = int(CONFIG.output.get("batchsize", 500))
@@ -158,6 +159,7 @@ def spawn_spider_process(urls, netloc_keywords, path_keywords, skip_domains, pro
         sitemap_max_urls=sitemap_max_urls,
         max_sitemap_depth=crawl_max_sitemap_depth,
         sitemap_page_budget=crawl_sitemap_page_budget,
+        facet_barren_guard=crawl_facet_barren_guard,
         jobdir=jobdir,
     )
 
@@ -313,6 +315,13 @@ if __name__ == "__main__":
     if len(dfs) > 0:
         results = pd.concat(dfs, ignore_index=True)
         print("#Results:", len(results))
+        # Safety net for the resume case: the spider's dedup ledger is in-memory and
+        # starts empty on a new run, so a re-crawled url can write a literal repeat.
+        # Keyed on the url as well, so this removes repeats of one page and nothing else.
+        results, dupes_dropped = drop_duplicate_rows(results)
+        if dupes_dropped:
+            logging.info("Dropped %d duplicate (base_url, url, content) rows; %d remain", dupes_dropped, len(results))
+            print("#Duplicate rows dropped:", dupes_dropped)
         # Cumulative: rewritten each run from the full union, so it always reflects every
         # run in this jobdir. Overwrite, not append.
         if jobdir_root:
