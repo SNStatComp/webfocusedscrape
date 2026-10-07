@@ -22,7 +22,8 @@ class PlaywrightTextFetcher:
             wait_time=1.5,
             max_concurrent_pages: int = 4,
             max_fetches_per_context: int = 1000,
-            close_timeout: int = 10):
+            close_timeout: int = 10,
+            fetch_timeout: int = 90):
         logging.debug("Initializing PlaywrightTextFetcher (pooled)")
         self.user_agent = user_agent
         self.max_retries = max_retries
@@ -34,6 +35,9 @@ class PlaywrightTextFetcher:
         # Cap each teardown step so a wedged Playwright close cannot block the reactor
         # indefinitely (it previously left workers hung for hours at shutdown)
         self.close_timeout = close_timeout
+        # Absolute ceiling per fetch so a dead browser page cannot pin a
+        # semaphore slot and _inflight forever
+        self.fetch_timeout = fetch_timeout
         # Created once here, never on recycle: rebuilding it mid-flight would strand
         # every coroutine already inside `async with self._semaphore`
         self._semaphore: asyncio.Semaphore | None = None
@@ -128,8 +132,13 @@ class PlaywrightTextFetcher:
                 return
             # Wait for in-flight pages to close before swapping the context. Called
             # with no semaphore slot held, so the wait can actually reach zero.
-            while self._inflight > 0:
+            # Bounded: with fetch_timeout every in-flight fetch drains on its own.
+            waited = 0.0
+            while self._inflight > 0 and waited < 120:
                 await asyncio.sleep(0.2)
+                waited += 0.2
+            if self._inflight > 0:
+                logging.warning("Recycling context with %d fetches still in-flight", self._inflight)
             logging.info(f"Recycling Playwright context after {self._fetch_count} fetches")
             await self.close()
             self._fetch_count = 0
@@ -158,11 +167,19 @@ class PlaywrightTextFetcher:
         # semaphore limits concurrent pages -> backpressure to Scrapy
         if self._semaphore is None:
             # fallback without semaphore if setup partially failed
-            return await self._fetch_with_retries(url)
+            try:
+                return await asyncio.wait_for(self._fetch_with_retries(url), timeout=self.fetch_timeout)
+            except asyncio.TimeoutError:
+                logging.warning(f"Playwright fetch timed out for {url} after {self.fetch_timeout}s")
+                return ""
         async with self._semaphore:
             self._inflight += 1
             try:
-                result = await self._fetch_with_retries(url)
+                try:
+                    result = await asyncio.wait_for(self._fetch_with_retries(url), timeout=self.fetch_timeout)
+                except asyncio.TimeoutError:
+                    logging.warning(f"Playwright fetch timed out for {url} after {self.fetch_timeout}s")
+                    result = ""
             finally:
                 self._inflight -= 1
             self._fetch_count += 1

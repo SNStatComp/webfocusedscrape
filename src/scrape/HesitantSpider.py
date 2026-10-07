@@ -1,3 +1,4 @@
+import asyncio
 import logging
 import re
 import time
@@ -244,6 +245,11 @@ class HesitantSpider(scrapy.Spider):
                 return None
             branch_domain, jumps = domain, 1
         return {**meta, "base_domain": base_domain, "branch_domain": branch_domain, "jumps": jumps}
+    
+    # closing function for clean and quick shutdown after timeout
+    def _closing(self) -> bool:
+        engine = getattr(getattr(self, "crawler", None), "engine", None)
+        return bool(engine is not None and getattr(engine, "closing", False))
 
     # Asynchronous function that starts the crawl
     async def start(self):
@@ -287,12 +293,12 @@ class HesitantSpider(scrapy.Spider):
 
         out = self.output_file.replace(".parquet", f"_{self.batch_counter}.parquet")
         try:
-            # Offload to thread to not block Twisted reactor
             future = self._save_executor.submit(lambda d=df, o=out: d.to_parquet(o))
-            future.result()  # wait, but in thread; keeps ordering. For fully async use add_done_callback.
+            future.result(timeout=120)
+        except TimeoutError as e:
+            self.logger.error(f"Timed out saving batch {self.batch_counter} to {out}: {e}")
         except Exception as e:
             self.logger.error(f"Failed to save batch {self.batch_counter} to {out}: {e}")
-            # fallback sync
             try:
                 df.to_parquet(out)
             except Exception as e2:
@@ -461,6 +467,8 @@ class HesitantSpider(scrapy.Spider):
         if scope is None:
             self.logger.debug(f"Skipping out-of-scope response: {response.url}")
             return
+        if self._closing():
+            return
         response_domain = self._site_domain(response.url)
         base_domain = scope["base_domain"]
         branch_domain = scope["branch_domain"]
@@ -483,6 +491,8 @@ class HesitantSpider(scrapy.Spider):
             self._job_sitemaps_probed.add(response_domain)
             parsed_host = urlparse(response.url)
             for sitemap_path in self.sitemaps_tocheck:
+                if self._closing():
+                    return
                 yield scrapy.Request(
                     url=urljoin(f"{parsed_host.scheme}://{parsed_host.netloc}/", sitemap_path),
                     callback=self.parse_sitemap,
@@ -560,6 +570,8 @@ class HesitantSpider(scrapy.Spider):
                 continue
             child_scope["depth"] = current_depth + 1
             child_scope["steps_from_target"] = 0 if url_is_targeted else steps_from_target + 1
+            if self._closing():
+                return
             yield scrapy.Request(
                 url=url,
                 callback=self.parse,
@@ -625,6 +637,8 @@ class HesitantSpider(scrapy.Spider):
         scope = self._scope(response.url, response.meta)
         if scope is None:
             return
+        if self._closing():
+            return
         # The sitemap must belong to a domain we are allowed to crawl here: either the
         # seed base domain, or an admitted off-base job domain. Scope its emitted urls to
         # that same domain so a job sitemap can never widen the crawl elsewhere.
@@ -662,6 +676,8 @@ class HesitantSpider(scrapy.Spider):
             if self._site_domain(url) != sitemap_domain or self.skip_this_url(url):
                 continue
 
+            if self._closing():
+                return
             is_nested_sitemap = url.lower().endswith('.xml')
 
             # Stop following a sitemap index once the page-url budget is spent
@@ -722,7 +738,10 @@ class HesitantSpider(scrapy.Spider):
 
     # Called when the spider closes cleanly
     async def closed(self, reason):
-        self.save_batch()
+        try:
+            self.save_batch()
+        except Exception as e:
+            self.logger.debug(f"Error in final save_batch: {e}")
         # Flush visited/sitemap buffers if JOBDIR
         if self.jobdir:
             try:
@@ -735,11 +754,13 @@ class HesitantSpider(scrapy.Spider):
             except Exception:
                 pass
         try:
-            await self._fetcher.close()
+            await asyncio.wait_for(self._fetcher.close(), timeout=60)
+        except asyncio.TimeoutError:
+            self.logger.warning("Playwright close timed out; continuing shutdown")
         except Exception as e:
             self.logger.debug(f"Error closing fetcher: {e}")
         try:
-            self._save_executor.shutdown(wait=True)
+            self._save_executor.shutdown(wait=False, cancel_futures=True)
         except Exception:
             pass
         self.logger.info(f"Spider closed because of: {reason}. Total saved pages: {self.total_saved}")
