@@ -1,7 +1,9 @@
 import asyncio
+import hashlib
 import logging
 import re
 import time
+from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
 from typing import List
@@ -91,6 +93,11 @@ class HesitantSpider(scrapy.Spider):
         sitemap_batch_size: int = 1000,  # internal batch for logging only
         jobdir: str | None = None,  # Scrapy JOBDIR for resume
         playwright_max_concurrent: int | None = None,  # None = default below
+        playwright_goto_timeout_ms: int | None = None,  # per-navigation timeout
+        playwright_set_content_timeout_ms: int | None = None,  # set_content timeout; short = fail fast to navigation
+        playwright_wait_time: float | None = None,  # adaptive post-load wait cap (s)
+        playwright_fetch_timeout: int | None = None,  # absolute per-fetch ceiling (s)
+        playwright_render_from_body: bool = False,  # render already-fetched HTML (one host fetch/page)
         *args, **kwargs
     ):
         super(HesitantSpider, self).__init__(*args, **kwargs)
@@ -148,7 +155,7 @@ class HesitantSpider(scrapy.Spider):
         self.jobdir = jobdir
 
         # Pre-compile regexes and build sets for hot paths
-        # Use IGNORECASE to catch OJA variants like /Vacatures/
+        # Use IGNORECASE to catch target variants like /Vacatures/
         self._re_netloc = [re.compile(k, re.IGNORECASE) for k in (target_netloc_keywords or [])]
         self._re_path = [re.compile(k, re.IGNORECASE) for k in (target_path_keywords or [])]
         self._re_jump_netloc = [re.compile(k, re.IGNORECASE) for k in (jump_netloc_keywords or [])]
@@ -160,7 +167,20 @@ class HesitantSpider(scrapy.Spider):
         self._allowed_languages_set = set(l.lower() for l in (allowed_languages or []))
         if playwright_max_concurrent is None:
             playwright_max_concurrent = 6
-        self._fetcher = PlaywrightTextFetcher(max_concurrent_pages=playwright_max_concurrent)
+        fetcher_kwargs = {"max_concurrent_pages": playwright_max_concurrent}
+        if playwright_goto_timeout_ms is not None:
+            fetcher_kwargs["goto_timeout_ms"] = int(playwright_goto_timeout_ms)
+        if playwright_set_content_timeout_ms is not None:
+            fetcher_kwargs["set_content_timeout_ms"] = int(playwright_set_content_timeout_ms)
+        if playwright_wait_time is not None:
+            fetcher_kwargs["wait_time"] = float(playwright_wait_time)
+        if playwright_fetch_timeout is not None:
+            fetcher_kwargs["fetch_timeout"] = int(playwright_fetch_timeout)
+        # Every browser navigation (initial or fallback) is paced through the shared
+        # politeness store, so the render channel is not an un-policed host channel.
+        fetcher_kwargs["pace"] = self._pace_url
+        self._fetcher = PlaywrightTextFetcher(**fetcher_kwargs)
+        self._render_from_body = bool(playwright_render_from_body)
         self.logger.debug(f"Playwright max_concurrent_pages={playwright_max_concurrent} for {len(start_urls)} start_urls")
         self._unsupported = {
             ".ics", ".mng", ".pct", ".bmp", ".gif", ".jpg", ".jpeg", ".png", ".webp", ".avif", ".pst", ".psp", ".tif", ".tiff", ".drw", ".dxf", ".eps",
@@ -179,11 +199,28 @@ class HesitantSpider(scrapy.Spider):
         self.batch = []
         self.total_saved = 0
         self.visited = set()
-        # For logging the (relevant) domains linked from each base-url
-        self.starturl_linkeddomains = {start_url: set() for start_url in start_urls}
+        # For logging the (relevant) domains linked from each base-url. A defaultdict
+        # because under the shared queue any worker may fetch a base_url that was not
+        # in its own start_urls chunk, so the key is not known up front.
+        self.starturl_linkeddomains = defaultdict(set)
         # per-base-domain accounting for the sitemap page-url budget
         self._sitemap_pages_used = {}
         self._sitemap_budget_warned = set()
+        # Content-dedup ledger, keyed by base_url then sha1 of the content. A row is
+        # written only the first time that base_url serves that content, so duplicate
+        # copies of the same document collapse to one. This mirrors ScrapyResult's
+        # own __eq__/__hash__, which define a row as (base_url, content).
+        #
+        # Why dedup and not a url-count cap: a cap cannot tell a domain enumerating
+        # facets from one with genuine per-job query urls, and it truncates whichever
+        # it guesses wrong about. Dedup on what we already hold cannot lose content -
+        # every distinct document keeps at least one row - which is the property the
+        # downstream classifier needs, since identical content yields an identical
+        # prediction and extra copies are worthless to it.
+        self._seen_content: dict[str, set[bytes]] = defaultdict(set)
+        # Lazily resolved shared store (content dedup) when the shared queue is on.
+        # None = not yet checked; False = checked and unavailable.
+        self._shared_store_ref = None
         # admitted off-base (job) domains whose own sitemap we have already probed
         self._job_sitemaps_probed = set()
         # executor for offloading parquet writes (avoid blocking reactor)
@@ -532,7 +569,8 @@ class HesitantSpider(scrapy.Spider):
                 except Exception:
                     pass
 
-        for link in response.css("a::attr(href)").getall():
+        links = response.css("a::attr(href)").getall()
+        for link in links:
             url = urljoin(response.url, link)
             
             # if undesired, skip and don't log domain
@@ -585,12 +623,18 @@ class HesitantSpider(scrapy.Spider):
             schema_indicator = bool(self._schemaparser.parse(response=response))
             # Whether the site used schema.org at all, independent of the keyword config
             follows_schema = self._schemaparser.has_structured_data(response=response)
+            content = await self._render(response)
+            # Write-time dedup: a base_url contributes each distinct document once.
+            # The fetch already happened, so this trades nothing for coverage - it
+            # only stops the same text being written once per facet permutation.
+            if not self._claim_content(str(scope["base_url"]), content):
+                return
             result = ScrapyResult(
                 base_url=str(scope["base_url"]),
                 url=response.url,
                 status=response.status,
                 first_keyword_hit=first_keyword_hit,
-                content=await self._fetcher.fetch(response.url),
+                content=content,
                 crawl_depth=current_depth,
                 schema_indicator=schema_indicator,
                 follows_schema=follows_schema,
@@ -599,6 +643,101 @@ class HesitantSpider(scrapy.Spider):
             self.batch.append(result)
             if len(self.batch) >= self.batch_size:
                 self.save_batch()
+
+    async def _render(self, response):
+        """Render a target page to text.
+
+        Host-load controls: the browser render is paced through the shared
+        politeness store (same global per-domain interval as Scrapy fetches), so
+        the render channel is no longer un-policed. When render_from_body is on,
+        the already-downloaded document is rendered via set_content instead of a
+        second navigation, so each target page costs one host fetch, not two.
+        """
+        html = response.body if self._render_from_body else None
+        # Navigation pacing (initial goto AND set_content fallback) is done inside
+        # the fetcher via the pace callback, so this channel is policed centrally.
+        return await self._fetcher.fetch(response.url, html=html)
+
+    async def _pace_url(self, url):
+        """Await the shared per-domain politeness interval before a navigation."""
+        store = self._get_shared_store()
+        if store is None:
+            return
+        try:
+            from src.scrape.sqlite_scheduler import site_domain
+
+            domain = site_domain(url)
+            if not domain:
+                return
+            interval = self.crawler.settings.getfloat("POLITENESS_MIN_INTERVAL", 0.25)
+            wait = await asyncio.to_thread(store.reserve_interval, domain, interval)
+            if wait > 0.001:
+                await asyncio.sleep(wait)
+        except Exception:
+            pass
+
+    def _get_shared_store(self):
+        """Shared content-dedup store when the shared queue is enabled, else None.
+
+        Resolved lazily because the crawler (and its settings) are attached after
+        __init__. Cached per spider; False marks "checked, not available".
+        """
+        ref = self._shared_store_ref
+        if ref is not None:
+            return ref or None
+        try:
+            settings = self.crawler.settings
+            path = settings.get("SHARED_QUEUE_SQLITE")
+            if not settings.getbool("SHARED_QUEUE_ENABLED", False) or not path:
+                self._shared_store_ref = False
+                return None
+            from src.scrape.sqlite_scheduler import get_store
+
+            self._shared_store_ref = get_store(
+                path,
+                lease_seconds=settings.getfloat("SHARED_QUEUE_LEASE", 900),
+                max_attempts=settings.getint("SHARED_QUEUE_MAX_ATTEMPTS", 3),
+                idle_before_close=settings.getfloat("SHARED_QUEUE_IDLE_BEFORE_CLOSE", 60),
+                domain_concurrency=settings.getint("SHARED_QUEUE_DOMAIN_CONCURRENCY", 0),
+            )
+        except Exception:
+            self._shared_store_ref = False
+            return None
+        return self._shared_store_ref
+
+    def _claim_content(self, base_url: str, content: str) -> bool:
+        """Return True the first time base_url serves this content, False after.
+
+        Keyed the same way ScrapyResult defines row identity - (base_url, content) -
+        so a document repeated across many facet URLs of one employer is stored once,
+        while the same text legitimately published by two different employers is kept
+        for both.
+
+        Under the shared queue this collapses across workers too: the ledger lives in
+        the shared store, so a base_url's facet urls fetched by different workers still
+        yield one row per document. Falls back to the per-worker in-memory ledger when
+        the shared queue is off.
+
+        Empty content is always claimed. A failed JS render says "we tried this url
+        and got nothing", which is worth keeping per url, and folding those together
+        would erase the record of which pages failed to hydrate.
+        """
+        try:
+            if not content or not content.strip():
+                return True
+            digest = hashlib.sha1(content.encode("utf-8", "ignore")).digest()
+            store = self._get_shared_store()
+            if store is not None:
+                return store.claim_content(base_url, digest)
+            seen = self._seen_content[base_url]
+            if digest in seen:
+                return False
+            seen.add(digest)
+            return True
+        except Exception:
+            # Dedup must never drop a row on a bookkeeping failure, whatever the
+            # cause: a non-string body, an unhashable base_url, OOM. Prefer keeping.
+            return True
 
     @staticmethod
     def sitemap_scope_meta(scope, sitemap_domain, response):

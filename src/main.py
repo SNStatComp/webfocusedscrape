@@ -11,7 +11,7 @@ from datetime import datetime
 from scrapy.crawler import CrawlerProcess
 
 from src.scrape import HesitantSpider
-from src.util import setup, normalize_url, read_parquet_dir, read_input_file
+from src.util import drop_duplicate_rows, setup, normalize_url, read_parquet_dir, read_input_file
 
 CONFIG = setup("config/config.yaml")
 
@@ -70,6 +70,61 @@ def spawn_spider_process(urls, netloc_keywords, path_keywords, skip_domains, pro
         "CLOSESPIDER_TIMEOUT": crawl_timeout,
     }
 
+    # Shared SQLite queue: one queue every worker pulls from, so no worker idles
+    # while another still has a backlog. Off by default; when on, the per-worker
+    # disk queue and requests.seen are unused (the shared DB replaces both) and
+    # JOBDIR is kept only for spider.state and the spider's own visited.txt.
+    jobdir_root = str(CONFIG.crawl.get("jobdir") or "").strip()
+    shared_queue_cfg = CONFIG.crawl.get("shared_queue")
+    shared_enabled = bool(shared_queue_cfg.get("enabled", False)) if shared_queue_cfg is not None else False
+    politeness_cfg = CONFIG.crawl.get("politeness")
+    politeness_enabled = bool(politeness_cfg.get("enabled", False)) if politeness_cfg is not None else False
+
+    def _store_path_for(cfg, default_name):
+        explicit = str((cfg.get("sqlite_path", "") if cfg is not None else "") or "").strip()
+        if explicit:
+            return explicit
+        return os.path.join(jobdir_root, default_name) if jobdir_root else None
+
+    # One store backs shared queue and/or politeness; reuse it when both are on.
+    store_path = _store_path_for(shared_queue_cfg, "shared_queue.sqlite") if shared_enabled else None
+    if politeness_enabled and store_path is None:
+        store_path = _store_path_for(politeness_cfg, "politeness.sqlite")
+    if (shared_enabled or politeness_enabled) and not store_path:
+        raise ValueError(
+            "crawl.shared_queue/politeness.enabled requires crawl.jobdir or an explicit sqlite_path"
+        )
+    if store_path:
+        try:
+            os.makedirs(os.path.dirname(store_path) or ".", exist_ok=True)
+        except Exception:
+            pass
+        settings["SHARED_QUEUE_SQLITE"] = store_path
+
+    if shared_enabled:
+        settings["SCHEDULER"] = "src.scrape.sqlite_scheduler.SqliteScheduler"
+        settings["DUPEFILTER_CLASS"] = "src.scrape.sqlite_scheduler.SqliteDupeFilter"
+        settings["SHARED_QUEUE_ENABLED"] = True
+        settings["SHARED_QUEUE_LEASE"] = float(shared_queue_cfg.get("lease_seconds", 900))
+        settings["SHARED_QUEUE_MAX_ATTEMPTS"] = int(shared_queue_cfg.get("max_attempts", 3))
+        settings["SHARED_QUEUE_IDLE_BEFORE_CLOSE"] = float(shared_queue_cfg.get("idle_before_close", 60))
+        print(f"Shared queue enabled: {store_path}")
+
+    if politeness_enabled:
+        settings["SHARED_QUEUE_DOMAIN_CONCURRENCY"] = int(politeness_cfg.get("domain_concurrency", 0))
+        settings["POLITENESS_MIN_INTERVAL"] = float(politeness_cfg.get("min_interval", 0.25))
+        settings["POLITENESS_BACKOFF_FACTOR"] = float(politeness_cfg.get("backoff_factor", 2.0))
+        settings["POLITENESS_BACKOFF_MAX"] = float(politeness_cfg.get("backoff_max", 60.0))
+        # Above RetryMiddleware (550) so process_response sees a 429/5xx before
+        # RetryMiddleware turns it into a retry request and short-circuits the chain.
+        settings["DOWNLOADER_MIDDLEWARES"][
+            "src.scrape.SharedPolitenessMiddleware.SharedPolitenessMiddleware"
+        ] = 590
+        print(
+            f"Politeness enabled: domain_concurrency={settings['SHARED_QUEUE_DOMAIN_CONCURRENCY']} "
+            f"min_interval={settings['POLITENESS_MIN_INTERVAL']}s store={store_path}"
+        )
+
     if jobdir:
         settings["JOBDIR"] = jobdir
         # Ensure jobdir exists
@@ -123,6 +178,11 @@ def spawn_spider_process(urls, netloc_keywords, path_keywords, skip_domains, pro
     crawl_max_sitemap_depth = int(CONFIG.crawl.get("max_sitemap_depth", 1))
     crawl_sitemap_page_budget = int(CONFIG.crawl.get("sitemap_page_budget", 5000))
     crawl_allowed_countries = list(CONFIG.crawl.get("allowed_countries", ["nl"]))
+    # Playwright ceiling knobs (crawl.playwright). None -> the spider's defaults.
+    pw_cfg = CONFIG.crawl.get("playwright")
+
+    def _pw(key, default=None):
+        return pw_cfg.get(key, default) if pw_cfg is not None else default
     # Rows per intermediary parquet batch; the batches are combined into the aggregate later
     output_batch_size = int(CONFIG.output.get("batchsize", 500))
 
@@ -159,6 +219,12 @@ def spawn_spider_process(urls, netloc_keywords, path_keywords, skip_domains, pro
         max_sitemap_depth=crawl_max_sitemap_depth,
         sitemap_page_budget=crawl_sitemap_page_budget,
         jobdir=jobdir,
+        playwright_max_concurrent=_pw("max_concurrent_pages"),
+        playwright_goto_timeout_ms=_pw("goto_timeout_ms"),
+        playwright_set_content_timeout_ms=_pw("set_content_timeout_ms"),
+        playwright_wait_time=_pw("wait_time"),
+        playwright_fetch_timeout=_pw("fetch_timeout"),
+        playwright_render_from_body=bool(_pw("render_from_body", False)),
     )
 
     # If worker gets 0 urls, pass (shouldn't happen)
@@ -313,6 +379,13 @@ if __name__ == "__main__":
     if len(dfs) > 0:
         results = pd.concat(dfs, ignore_index=True)
         print("#Results:", len(results))
+        # Safety net for the resume case: the spider's dedup ledger is in-memory and
+        # starts empty on a new run, so a re-crawled url can write a literal repeat.
+        # Keyed on the url as well, so this removes repeats of one page and nothing else.
+        results, dupes_dropped = drop_duplicate_rows(results)
+        if dupes_dropped:
+            logging.info("Dropped %d duplicate (base_url, url, content) rows; %d remain", dupes_dropped, len(results))
+            print("#Duplicate rows dropped:", dupes_dropped)
         # Cumulative: rewritten each run from the full union, so it always reflects every
         # run in this jobdir. Overwrite, not append.
         if jobdir_root:

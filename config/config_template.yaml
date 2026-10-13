@@ -36,6 +36,25 @@ crawl:
   allowed_countries: [nl]
   use_sitemap: True
   use_jump_whitelist: True
+  shared_queue:
+    enabled: False # One shared SQLite queue all workers pull from, so idle workers drain a busy worker's backlog. Off = per-worker disk queues (unchanged).
+    sqlite_path: "" # Empty = derive from crawl.jobdir root as <jobdir>/shared_queue.sqlite. Required if enabled and no jobdir.
+    lease_seconds: 900 # A claimed request not acked within this window is re-delivered (crash recovery). Must exceed worst-case fetch.
+    max_attempts: 3 # Max re-deliveries per request after lease expiry before it is dropped.
+    idle_before_close: 60 # Seconds a worker waits on an empty shared queue before closing, so transient empty moments do not stop the crawl.
+  politeness:
+    enabled: False # Global per-domain politeness shared across all workers. Without it, Scrapy's per-worker limit multiplies by worker count on one host.
+    domain_concurrency: 4 # Global simultaneous requests per registrable domain, across all workers.
+    min_interval: 0.25 # Global min seconds between requests to one domain, across all workers.
+    backoff_factor: 2.0 # Multiply a domain's spacing on 429/503/403.
+    backoff_max: 60.0 # Ceiling for the spacing multiplier, in seconds.
+  playwright: # Playwright render ceiling. Renders finish <12s for ~99% of pages at polite concurrency; >3/domain inflates latency.
+    max_concurrent_pages: 6 # Concurrent browser tabs per worker. 10 doubled render timeouts with no throughput gain (host-bound); 6 is the clean baseline.
+    goto_timeout_ms: 12000 # Per-navigation timeout; lower fails fast and frees a render slot.
+    set_content_timeout_ms: 12000 # set_content wait. 3s was too aggressive: it forced fallback navigations for pages that finish in 3-12s, cutting throughput ~2x. Keep aligned with goto_timeout.
+    wait_time: 1.0 # Adaptive post-load wait cap, seconds.
+    fetch_timeout: 90 # Absolute per-fetch ceiling (retries included), seconds.
+    render_from_body: True # Render the already-downloaded HTML in-browser (set_content): one host fetch per target page, not two.
   jobdir: # Resume state, one subdir per worker. Must persist between runs. Empty = no resume.
   schema:
     keyword:
