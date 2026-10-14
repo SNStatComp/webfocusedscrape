@@ -15,7 +15,12 @@ class IFetcher(ABC):
 
     @abstractmethod
     def fetch(self, url: str):
-        """Fetches content for given url"""
+        """Fetch content for given url by navigating to it."""
+        raise NotImplementedError()
+
+    @abstractmethod
+    def render(self, url: str, html = None):
+        """Render already-downloaded HTML for given url to text."""
         raise NotImplementedError()
 
     @abstractmethod
@@ -41,6 +46,11 @@ class NoFetcher(IFetcher):
     def fetch(self, url: str) -> str:
         """Fetches default minimal html"""
         self.results[url] = self._default_html
+        return self.results[url]
+
+    def render(self, url: str, html=None) -> str:
+        """Renders supplied (or default) html to text."""
+        self.results[url] = html if html is not None else self._default_html
         return self.results[url]
 
     def get_results(self) -> Dict[str, str]:

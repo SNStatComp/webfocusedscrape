@@ -161,7 +161,15 @@ class PlaywrightTextFetcher:
             await self._launch_browser()
             logging.info("Playwright context recycled")
 
-    async def fetch(self, url: str, html: bytes | str | None = None) -> Union[str, dict]:
+    async def fetch(self, url: str) -> Union[str, dict]:
+        """Fetch content for url by navigating to it (network fetch)."""
+        return await self._execute(url, html=None)
+
+    async def render(self, url: str, html: bytes | str | None = None) -> Union[str, dict]:
+        """Render already-downloaded HTML for url to text. No host fetch upfront."""
+        return await self._execute(url, html=html)
+
+    async def _execute(self, url: str, html: bytes | str | None = None) -> Union[str, dict]:
         """
         Asynchronous fetch using pooled Playwright.
         Returns text_content or "" on failure.

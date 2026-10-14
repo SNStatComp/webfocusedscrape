@@ -623,7 +623,7 @@ class HesitantSpider(scrapy.Spider):
             schema_indicator = bool(self._schemaparser.parse(response=response))
             # Whether the site used schema.org at all, independent of the keyword config
             follows_schema = self._schemaparser.has_structured_data(response=response)
-            content = await self._render(response)
+            content = await self._rendered_text(response)
             # Write-time dedup: a base_url contributes each distinct document once.
             # The fetch already happened, so this trades nothing for coverage - it
             # only stops the same text being written once per facet permutation.
@@ -644,19 +644,19 @@ class HesitantSpider(scrapy.Spider):
             if len(self.batch) >= self.batch_size:
                 self.save_batch()
 
-    async def _render(self, response):
-        """Render a target page to text.
+    async def _rendered_text(self, response):
+        """Render a target page to plain text.
 
-        Host-load controls: the browser render is paced through the shared
-        politeness store (same global per-domain interval as Scrapy fetches), so
-        the render channel is no longer un-policed. When render_from_body is on,
-        the already-downloaded document is rendered via set_content instead of a
-        second navigation, so each target page costs one host fetch, not two.
+        Returns the rendered text used both for re-list signature detection and
+        content dedup (_claim_content), and stored as ScrapyResult.content.
+        Chooses the fetcher path by source: a network fetch when we do not
+        already hold the document, or rendering of the already-downloaded body
+        (render_from_body) when we do.
         """
-        html = response.body if self._render_from_body else None
-        # Navigation pacing (initial goto AND set_content fallback) is done inside
-        # the fetcher via the pace callback, so this channel is policed centrally.
-        return await self._fetcher.fetch(response.url, html=html)
+        url = response.url
+        if self._render_from_body and getattr(response, "body", None):
+            return await self._fetcher.render(url, html=response.body)
+        return await self._fetcher.fetch(url)
 
     async def _pace_url(self, url):
         """Await the shared per-domain politeness interval before a navigation."""
