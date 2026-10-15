@@ -23,12 +23,26 @@ class PlaywrightTextFetcher:
             max_concurrent_pages: int = 4,
             max_fetches_per_context: int = 1000,
             close_timeout: int = 10,
-            fetch_timeout: int = 90):
+            fetch_timeout: int = 90,
+            goto_timeout_ms: int = 20000,
+            set_content_timeout_ms: int = 3000,
+            pace=None):
         logging.debug("Initializing PlaywrightTextFetcher (pooled)")
         self.user_agent = user_agent
         self.max_retries = max_retries
         self.wait_time = wait_time  # Adaptive cap, not fixed sleep
         self.max_concurrent_pages = max_concurrent_pages
+        # Per-navigation timeout. Lower = fail fast and free a render slot sooner;
+        # the ceiling harness showed p99 render completes well under this at
+        # polite per-domain concurrency.
+        self.goto_timeout_ms = int(goto_timeout_ms)
+        # Rendering already-fetched HTML should not block on synchronous scripts that
+        # never finish, so its wait is much shorter: on timeout we fall back to a real
+        # navigation (which still yields the page), so shorten it aggressively.
+        self.set_content_timeout_ms = int(set_content_timeout_ms)
+        # Optional async callback awaited before every navigation (initial or
+        # fallback), so the render channel obeys the shared per-domain politeness.
+        self._pace = pace
         # Recycle browser+context after this many fetches: a single long-lived context
         # accumulates per-domain caches/state and its memory grows monotonically
         self.max_fetches_per_context = max_fetches_per_context
@@ -148,9 +162,22 @@ class PlaywrightTextFetcher:
             logging.info("Playwright context recycled")
 
     async def fetch(self, url: str) -> Union[str, dict]:
+        """Fetch content for url by navigating to it (network fetch)."""
+        return await self._execute(url, html=None)
+
+    async def render(self, url: str, html: bytes | str | None = None) -> Union[str, dict]:
+        """Render already-downloaded HTML for url to text. No host fetch upfront."""
+        return await self._execute(url, html=html)
+
+    async def _execute(self, url: str, html: bytes | str | None = None) -> Union[str, dict]:
         """
         Asynchronous fetch using pooled Playwright.
         Returns text_content or "" on failure.
+
+        If ``html`` is given (the already-downloaded document), the browser renders
+        that document with ``set_content`` instead of navigating, so the document is
+        fetched from the host only once (once by the crawler, zero more here). A
+        ``<base href=url>`` is injected so relative sub-resources still resolve.
         """
         logging.debug(f"Playwright fetch: {url}")
         if not self.setup_playwright:
@@ -168,7 +195,7 @@ class PlaywrightTextFetcher:
         if self._semaphore is None:
             # fallback without semaphore if setup partially failed
             try:
-                return await asyncio.wait_for(self._fetch_with_retries(url), timeout=self.fetch_timeout)
+                return await asyncio.wait_for(self._fetch_with_retries(url, html=html), timeout=self.fetch_timeout)
             except asyncio.TimeoutError:
                 logging.warning(f"Playwright fetch timed out for {url} after {self.fetch_timeout}s")
                 return ""
@@ -176,7 +203,7 @@ class PlaywrightTextFetcher:
             self._inflight += 1
             try:
                 try:
-                    result = await asyncio.wait_for(self._fetch_with_retries(url), timeout=self.fetch_timeout)
+                    result = await asyncio.wait_for(self._fetch_with_retries(url, html=html), timeout=self.fetch_timeout)
                 except asyncio.TimeoutError:
                     logging.warning(f"Playwright fetch timed out for {url} after {self.fetch_timeout}s")
                     result = ""
@@ -189,7 +216,22 @@ class PlaywrightTextFetcher:
         # kept for backwards compat; Playwright fetcher is stateless (not caching by url)
         return {}
 
-    async def _fetch_with_retries(self, url: str, retries: int = 0):
+    @staticmethod
+    def _with_base(html, url: str) -> str:
+        """Inject ``<base href=url>`` so relative sub-resources resolve when
+        rendering already-fetched HTML via set_content."""
+        if isinstance(html, bytes):
+            html = html.decode("utf-8", "ignore")
+        base = f'<base href="{url}">'
+        lower = html.lower()
+        idx = lower.find("<head")
+        if idx != -1:
+            end = lower.find(">", idx)
+            if end != -1:
+                return html[: end + 1] + base + html[end + 1:]
+        return base + html
+
+    async def _fetch_with_retries(self, url: str, retries: int = 0, html: bytes | str | None = None):
         if self._context is None:
             logging.error(f"No Playwright context available for {url}")
             return ""
@@ -197,7 +239,16 @@ class PlaywrightTextFetcher:
         try:
             page = await self._context.new_page()
             # Faster than full networkidle; adaptive wait below handles JS
-            await page.goto(url, wait_until="domcontentloaded", timeout=20000)
+            if html is not None:
+                await page.set_content(self._with_base(html, url), wait_until="domcontentloaded",
+                                       timeout=self.set_content_timeout_ms)
+            else:
+                if self._pace is not None:
+                    try:
+                        await self._pace(url)
+                    except Exception:
+                        pass
+                await page.goto(url, wait_until="domcontentloaded", timeout=self.goto_timeout_ms)
             # Adaptive wait: try networkidle briefly, fallback to short sleep
             try:
                 await page.wait_for_load_state("networkidle", timeout=int(self.wait_time * 1000))
@@ -211,6 +262,18 @@ class PlaywrightTextFetcher:
                 await asyncio.sleep(min(self.wait_time, 1.0))
 
             text_content = await self._extract_clean_text(page)
+            # set_content skips the host navigation but can under-render JS-heavy
+            # pages (their text never appears). If we rendered from a supplied body
+            # and got implausibly little text relative to the document, fall back to
+            # a real navigation. Costs only local render time, not an extra host hit
+            # for the fallback's own attempt (it does navigate once, like the old
+            # behaviour) - so no worse than before for those pages.
+            if html is not None and retries < self.max_retries:
+                raw_len = len(html)
+                if len(text_content) < max(200, 0.01 * raw_len):
+                    logging.debug("set_content under-rendered %s (%d chars); retrying via navigation",
+                                  url, len(text_content))
+                    return await self._fetch_with_retries(url, retries + 1, html=None)
             return text_content
 
         except (PlaywrightError, Exception) as e:
@@ -218,7 +281,11 @@ class PlaywrightTextFetcher:
             if retries < self.max_retries:
                 # exponential backoff 0.5, 1.0s
                 await asyncio.sleep(0.5 * (2 ** retries))
-                return await self._fetch_with_retries(url, retries + 1)
+                # A set_content failure (typically it hangs waiting on synchronous
+                # scripts that never finish) must fall back to a real navigation, or
+                # the page's content is lost. If we were already navigating, this is
+                # just a normal retry.
+                return await self._fetch_with_retries(url, retries + 1, html=None)
             return ""
         finally:
             if page is not None:
