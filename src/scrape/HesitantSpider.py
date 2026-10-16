@@ -48,12 +48,11 @@ class HesitantSpider(scrapy.Spider):
         "AUTOTHROTTLE_ENABLED": True,
         "AUTOTHROTTLE_START_DELAY": 1.0,
         "AUTOTHROTTLE_MAX_DELAY": 10.0,
-        "AUTOTHROTTLE_TARGET_CONCURRENCY": 2.0,
+        "AUTOTHROTTLE_TARGET_CONCURRENCY": 4.0,
         "AUTOTHROTTLE_DEBUG": False,
         "CONCURRENT_REQUESTS": 16,
-        # Keep in sync with src/main.py: polite per-domain ceiling so standalone
-        # runs (this block) behave like pooled workers. See note in main.py.
-        "CONCURRENT_REQUESTS_PER_DOMAIN": 2,
+        # Per-domain ceiling; the shared global politeness store bounds whole-fleet host load.
+        "CONCURRENT_REQUESTS_PER_DOMAIN": 6,
         "DOWNLOAD_DELAY": 0,  # AutoThrottle supplies the adaptive delay
         "DOWNLOAD_TIMEOUT": 10,
         "RETRY_TIMES": 2,

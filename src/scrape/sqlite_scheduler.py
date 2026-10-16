@@ -81,6 +81,13 @@ CREATE TABLE IF NOT EXISTS queue (
 CREATE INDEX IF NOT EXISTS queue_claim ON queue (lease_until, priority, id);
 CREATE INDEX IF NOT EXISTS queue_fp ON queue (fingerprint);
 CREATE INDEX IF NOT EXISTS queue_domain ON queue (domain, lease_until);
+-- Bounds the per-domain in-flight cap subquery in claim() to the leased rows:
+-- without this it scans the whole queue (~40ms at 600k rows) on every claim.
+CREATE INDEX IF NOT EXISTS queue_lease_domain ON queue (lease_until, domain);
+-- Hot claim path: only idle rows, already in (priority DESC, id ASC) order, so a
+-- claim is an index lookup instead of a full-queue scan + temp-B-tree sort. The
+-- non-partial indexes above stay for the rare expired-lease reclaim and dedup.
+CREATE INDEX IF NOT EXISTS queue_idle ON queue (priority DESC, id) WHERE lease_until IS NULL;
 CREATE TABLE IF NOT EXISTS content_seen (
     base_url TEXT NOT NULL,
     digest BLOB NOT NULL,
@@ -128,6 +135,22 @@ class SharedStore:
         self.conn.execute("PRAGMA journal_mode=WAL")
         self.conn.execute("PRAGMA synchronous=NORMAL")
         self.conn.execute("PRAGMA busy_timeout=10000")
+        # Keep the WAL from growing without bound while many connections stay open
+        # (it reached multiple GB in a long run because checkpoints were starved).
+        self.conn.execute("PRAGMA journal_size_limit=67108864")
+        self._commits = 0
+        self._checkpoint_every = 1000
+        # Fast-path dedup for fingerprints this worker already enqueued. The DB
+        # seen table still dedups across workers, but the common case is the same
+        # link repeated across many pages of one site; without this every repeat
+        # takes the global BEGIN IMMEDIATE write lock and serializes the fleet.
+        # Bounded so a very long run cannot grow it without limit.
+        self._local_seen = set()
+        self._local_seen_max = 2_000_000
+        # Enqueue rows are buffered and written in one transaction per flush.
+        self.ENQUEUE_BATCH = 200
+        self._enqueue_buffer = []
+        self._ack_buffer = []
         self.conn.executescript(_SCHEMA)
         # Migrate a queue table created before the domain column existed.
         cols = {row[1] for row in self.conn.execute("PRAGMA table_info(queue)")}
@@ -159,6 +182,20 @@ class SharedStore:
                 try:
                     result = fn(self.conn)
                     self.conn.execute("COMMIT")
+                    self._commits += 1
+                    # Periodic TRUNCATE checkpoint bounds the WAL. It waits (up to
+                    # busy_timeout) for the other workers' short read snapshots to
+                    # clear, then resets the WAL file. Reads are serialized with
+                    # writes per connection, so no snapshot is left open to starve
+                    # this. Fall back to PASSIVE if TRUNCATE cannot get its turn.
+                    if self._commits % self._checkpoint_every == 0:
+                        try:
+                            self.conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+                        except sqlite3.Error:
+                            try:
+                                self.conn.execute("PRAGMA wal_checkpoint(PASSIVE)")
+                            except sqlite3.Error:
+                                pass
                     return result
                 except Exception:
                     self.conn.execute("ROLLBACK")
@@ -174,81 +211,126 @@ class SharedStore:
             return False
         fp = fingerprint(request, fingerprinter)
         internal = bool(request.dont_filter)
+        # A fingerprint this worker already enqueued is not new in the shared DB
+        # either, so answer without acquiring the global write lock.
+        if not internal:
+            if fp in self._local_seen:
+                return False
+            if len(self._local_seen) >= self._local_seen_max:
+                self._local_seen.clear()
+            self._local_seen.add(fp)
         prio = int(request.priority)
         domain = site_domain(request.url)
         qid = request.meta.get(QID) if internal else None
+        # Buffer the row. A page yields ~50 links; flushing each one in its own
+        # write transaction is what serialized the whole fleet on the SQLite
+        # write lock. They are written together on the next claim/check.
+        self._enqueue_buffer.append(
+            (fp, int(request.priority), blob, site_domain(request.url), qid, internal)
+        )
+        if len(self._enqueue_buffer) >= self.ENQUEUE_BATCH:
+            self._flush_enqueues()
+        return True
+
+    def _flush_enqueues(self):
+        """Persist buffered enqueues and acks in a single write transaction."""
+        if not self._enqueue_buffer and not self._ack_buffer:
+            return
+        enq = self._enqueue_buffer
+        acks = self._ack_buffer
+        self._enqueue_buffer = []
+        self._ack_buffer = []
 
         def txn(conn):
-            newly = conn.execute(
-                "INSERT OR IGNORE INTO seen(fingerprint) VALUES (?)", (fp,)
-            ).rowcount == 1
-            if not internal and not newly:
-                return False
-            if qid is not None:
-                updated = conn.execute(
-                    "UPDATE queue SET fingerprint=?, priority=?, request=?, lease_until=NULL, domain=? WHERE id=?",
-                    (fp, prio, blob, domain, qid),
-                ).rowcount
-                if updated:
-                    return True
-            # Keep the queue idempotent per fingerprint. This catches the restart
-            # case where start() re-yields every seed with dont_filter=True: without
-            # it a seed still pending from the previous run would be queued twice and
-            # fetched twice.
-            if conn.execute("SELECT 1 FROM queue WHERE fingerprint=? LIMIT 1", (fp,)).fetchone() is not None:
-                return True
-            conn.execute(
-                "INSERT INTO queue(fingerprint, priority, request, attempts, lease_until, domain) "
-                "VALUES (?, ?, ?, 0, NULL, ?)",
-                (fp, prio, blob, domain),
-            )
-            return True
+            for qid in acks:
+                conn.execute("DELETE FROM queue WHERE id=?", (qid,))
+            for fp, prio, blob, domain, qid, internal in enq:
+                newly = conn.execute(
+                    "INSERT OR IGNORE INTO seen(fingerprint) VALUES (?)", (fp,)
+                ).rowcount == 1
+                if not internal and not newly:
+                    continue
+                if qid is not None:
+                    updated = conn.execute(
+                        "UPDATE queue SET fingerprint=?, priority=?, request=?, lease_until=NULL, domain=? WHERE id=?",
+                        (fp, prio, blob, domain, qid),
+                    ).rowcount
+                    if updated:
+                        continue
+                # Keep the queue idempotent per fingerprint (restart case).
+                if conn.execute("SELECT 1 FROM queue WHERE fingerprint=? LIMIT 1", (fp,)).fetchone() is not None:
+                    continue
+                conn.execute(
+                    "INSERT INTO queue(fingerprint, priority, request, attempts, lease_until, domain) "
+                    "VALUES (?, ?, ?, 0, NULL, ?)",
+                    (fp, prio, blob, domain),
+                )
 
-        return bool(self._tx(txn))
+        try:
+            self._tx(txn)
+        except Exception:
+            # A transient failure must not drop urls/acks; retry on the next flush.
+            self._enqueue_buffer = enq + self._enqueue_buffer
+            self._ack_buffer = acks + self._ack_buffer
+            raise
 
     # -- claim --------------------------------------------------------------
     def claim(self, spider):
+        self._flush_enqueues()
         now = time.time()
         deadline = now + self.lease_seconds
         cap = self.domain_concurrency
 
         def txn(conn):
-            while True:
-                if cap and cap > 0:
-                    # Skip domains already at their global in-flight cap, so a
-                    # saturated domain is alternated away from rather than waited on.
-                    # In-flight = rows whose lease is still live; a leaked slot
-                    # self-heals when its lease expires.
-                    row = conn.execute(
-                        "SELECT id, attempts, request, lease_until FROM queue "
-                        "WHERE (lease_until IS NULL OR lease_until < ?) "
-                        "AND (domain IS NULL OR domain NOT IN ("
-                        "    SELECT domain FROM queue WHERE lease_until > ? "
-                        "    GROUP BY domain HAVING COUNT(*) >= ?)) "
-                        "ORDER BY priority DESC, id ASC LIMIT 1",
-                        (now, now, cap),
-                    ).fetchone()
+            # 1. Recover an expired lease first (crash or missed ack). Expired rows
+            #    are not in the partial idle index, so use the non-partial
+            #    queue_claim index; this path is rare and cheap.
+            row = conn.execute(
+                "SELECT id, attempts, request FROM queue "
+                "WHERE lease_until IS NOT NULL AND lease_until < ? "
+                "ORDER BY priority DESC, id ASC LIMIT 1",
+                (now,),
+            ).fetchone()
+            if row is not None:
+                qid, attempts, blob = row
+                attempts += 1
+                if attempts >= self.max_attempts:
+                    conn.execute("DELETE FROM queue WHERE id=?", (qid,))
+                    # Fall through and try a fresh idle row instead of returning.
                 else:
-                    row = conn.execute(
-                        "SELECT id, attempts, request, lease_until FROM queue "
-                        "WHERE lease_until IS NULL OR lease_until < ? "
-                        "ORDER BY priority DESC, id ASC LIMIT 1",
-                        (now,),
-                    ).fetchone()
-                if row is None:
-                    return None
-                qid, attempts, blob, lease_until = row
-                if lease_until is not None and lease_until < now:
-                    # Re-delivery after a crash or a missed ack.
-                    attempts += 1
-                    if attempts >= self.max_attempts:
-                        conn.execute("DELETE FROM queue WHERE id=?", (qid,))
-                        continue
-                conn.execute(
-                    "UPDATE queue SET lease_until=?, attempts=? WHERE id=?",
-                    (deadline, attempts, qid),
-                )
-                return qid, blob
+                    conn.execute(
+                        "UPDATE queue SET lease_until=?, attempts=? WHERE id=?",
+                        (deadline, attempts, qid),
+                    )
+                    return qid, blob
+
+            # 2. Fresh idle row. INDEXED BY queue_idle keeps this an ordered index
+            #    scan (no full-queue scan, no temp-B-tree sort) even with the
+            #    domain-cap NOT IN filter. The cap subquery only touches live
+            #    leases, so its cost is bounded by in-flight rows, not queue size.
+            if cap and cap > 0:
+                row = conn.execute(
+                    "SELECT id, attempts, request FROM queue INDEXED BY queue_idle "
+                    "WHERE lease_until IS NULL AND (domain IS NULL OR domain NOT IN ("
+                    "    SELECT domain FROM queue INDEXED BY queue_lease_domain "
+                    "    WHERE lease_until > ? GROUP BY domain HAVING COUNT(*) >= ?)) "
+                    "ORDER BY priority DESC, id ASC LIMIT 1",
+                    (now, cap),
+                ).fetchone()
+            else:
+                row = conn.execute(
+                    "SELECT id, attempts, request FROM queue INDEXED BY queue_idle "
+                    "WHERE lease_until IS NULL "
+                    "ORDER BY priority DESC, id ASC LIMIT 1"
+                ).fetchone()
+            if row is None:
+                return None
+            qid, attempts, blob = row
+            conn.execute(
+                "UPDATE queue SET lease_until=?, attempts=? WHERE id=?",
+                (deadline, attempts, qid),
+            )
+            return qid, blob
 
         result = self._tx(txn)
         if result is None:
@@ -267,11 +349,15 @@ class SharedStore:
     def ack(self, qid):
         if qid is None:
             return
-        try:
-            self.conn.execute("DELETE FROM queue WHERE id=?", (qid,))
-        except sqlite3.OperationalError:
-            # A failed ack only means the row is re-delivered after lease expiry.
-            pass
+        # Buffer the delete; rows are removed in the next write flush so every
+        # fetched page does not cost its own write transaction.
+        self._ack_buffer.append(qid)
+        if len(self._ack_buffer) >= self.ENQUEUE_BATCH:
+            try:
+                self._flush_enqueues()
+            except Exception:
+                # A failed ack only means the row is re-delivered after lease expiry.
+                pass
 
     def claim_content(self, base_url, digest) -> bool:
         def txn(conn):
@@ -329,7 +415,20 @@ class SharedStore:
         self._tx(txn)
 
     def note_success(self, domain: str) -> None:
-        """Halve this domain's backoff penalty after a good response."""
+        """Halve this domain's backoff penalty after a good response.
+
+        Most domains carry no penalty at all, so read first and skip the write
+        transaction entirely; this removes one serialized write per good response
+        (a shared-queue hot path) in the common case.
+        """
+        try:
+            row = self.conn.execute(
+                "SELECT penalty FROM domain_state WHERE domain=?", (domain,)
+            ).fetchone()
+        except sqlite3.Error:
+            return
+        if not row or row[0] <= 0:
+            return
 
         def txn(conn):
             conn.execute(
@@ -340,17 +439,23 @@ class SharedStore:
         self._tx(txn)
 
     def domain_next_at(self, domain: str) -> float:
-        row = self.conn.execute(
-            "SELECT next_at FROM domain_state WHERE domain=?", (domain,)
-        ).fetchone()
+        # Reads share the one connection, so serialize with writes too: a read
+        # running concurrently with a write on the same connection can leave a
+        # WAL read snapshot open, which then blocks checkpointing and lets the
+        # WAL grow without bound.
+        with self._lock:
+            row = self.conn.execute(
+                "SELECT next_at FROM domain_state WHERE domain=?", (domain,)
+            ).fetchone()
         return float(row[0]) if row else 0.0
 
     def inflight_by_domain(self):
         now = time.time()
-        return self.conn.execute(
-            "SELECT domain, COUNT(*) FROM queue WHERE lease_until > ? GROUP BY domain",
-            (now,),
-        ).fetchall()
+        with self._lock:
+            return self.conn.execute(
+                "SELECT domain, COUNT(*) FROM queue WHERE lease_until > ? GROUP BY domain",
+                (now,),
+            ).fetchall()
 
     def has_pending(self) -> bool:
         """True while any row exists, so a live peer's in-flight work keeps others alive.
@@ -358,8 +463,10 @@ class SharedStore:
         Only once the queue is empty everywhere does the grace timer start, which
         is what stops every worker from closing on a transient empty moment.
         """
+        self._flush_enqueues()
         try:
-            row = self.conn.execute("SELECT 1 FROM queue LIMIT 1").fetchone()
+            with self._lock:
+                row = self.conn.execute("SELECT 1 FROM queue LIMIT 1").fetchone()
         except sqlite3.Error:
             return True
         if row is not None:
@@ -371,11 +478,16 @@ class SharedStore:
         return (now - self._idle_since) < self.idle_before_close
 
     def counts(self):
-        pending = self.conn.execute("SELECT COUNT(*) FROM queue").fetchone()[0]
-        seen = self.conn.execute("SELECT COUNT(*) FROM seen").fetchone()[0]
+        with self._lock:
+            pending = self.conn.execute("SELECT COUNT(*) FROM queue").fetchone()[0]
+            seen = self.conn.execute("SELECT COUNT(*) FROM seen").fetchone()[0]
         return pending, seen
 
     def close(self):
+        try:
+            self._flush_enqueues()
+        except Exception:
+            pass
         try:
             self.conn.close()
         except Exception:

@@ -54,12 +54,12 @@ def spawn_spider_process(urls, netloc_keywords, path_keywords, skip_domains, pro
         "DOWNLOAD_CONTENT_TYPES": ["text/html", "application/xhtml+xml", "application/xml", "text/xml"],
         "TWISTED_REACTOR": "twisted.internet.asyncioreactor.AsyncioSelectorReactor",
         "CONCURRENT_REQUESTS": 32,
-        "CONCURRENT_REQUESTS_PER_DOMAIN": 2,  # polite per-domain ceiling so standalone runs (this block) behave like pooled workers. No domain hammering.
+        "CONCURRENT_REQUESTS_PER_DOMAIN": 6,  # per-domain ceiling; the shared global politeness store bounds whole-fleet host load
         "DOWNLOAD_DELAY": 0,
         "AUTOTHROTTLE_ENABLED": True,
         "AUTOTHROTTLE_START_DELAY": 1.0,
         "AUTOTHROTTLE_MAX_DELAY": 10.0,
-        "AUTOTHROTTLE_TARGET_CONCURRENCY": 2.0,
+        "AUTOTHROTTLE_TARGET_CONCURRENCY": 4.0,
         "DOWNLOAD_TIMEOUT": download_timeout,
         "RETRY_TIMES": retry_times,
         "DOWNLOAD_MAXSIZE": 10485760,  # prevent large file download
@@ -243,6 +243,7 @@ def spawn_spider_process(urls, netloc_keywords, path_keywords, skip_domains, pro
 
 
 if __name__ == "__main__":
+    # TODO check if playwright is properly installed and if not stop the run with error
 
     # Set logging level and create file
     # All workers write to same log

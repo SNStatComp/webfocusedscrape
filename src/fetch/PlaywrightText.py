@@ -78,18 +78,33 @@ class PlaywrightTextFetcher:
         coroutines may be starting up concurrently; go through
         setup_playwright_browser unless _recycle_lock is already held."""
         self._playwright = await async_playwright().start()
-        # Keep one browser/worker, reuse context
-        self._browser = await self._playwright.chromium.launch(
-            headless=True,
-            args=["--disable-dev-shm-usage", "--no-sandbox", "--disable-gpu", "--disable-extensions"]
-        )
-        self._context = await self._browser.new_context(
-            user_agent=self.user_agent,
-            ignore_https_errors=False,
-            java_script_enabled=True,
-        )
-        # Block heavy resources at context level
-        await self._context.route("**/*", self._route_handler)
+        try:
+            # Keep one browser/worker, reuse context
+            self._browser = await self._playwright.chromium.launch(
+                headless=True,
+                args=["--disable-dev-shm-usage", "--no-sandbox", "--disable-gpu", "--disable-extensions"]
+            )
+            self._context = await self._browser.new_context(
+                user_agent=self.user_agent,
+                ignore_https_errors=False,
+                java_script_enabled=True,
+            )
+            # Block heavy resources at context level
+            await self._context.route("**/*", self._route_handler)
+        except Exception:
+            # Roll back any partial startup so a failed launch does not leak a
+            # playwright driver: retries then start from a clean state instead of
+            # piling up orphan node processes (seen as driver-count explosion).
+            if self._context is not None:
+                await self._close_step("context", self._context.close)
+            if self._browser is not None:
+                await self._close_step("browser", self._browser.close)
+            if self._playwright is not None:
+                await self._close_step("playwright", self._playwright.stop)
+            self._context = None
+            self._browser = None
+            self._playwright = None
+            raise
         # Only created once: a recycle must not swap the semaphore out from under
         # coroutines that are inside `async with self._semaphore`
         if self._semaphore is None:
