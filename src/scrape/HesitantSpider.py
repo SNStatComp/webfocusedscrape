@@ -28,7 +28,7 @@ _CCTLD = frozenset(t for t in _TLD_EXTRACT.tlds if len(t) == 2 and t.isalpha())
 # infinite, never match JobPosting target keywords, and hammer small hosts into
 # HTTP 429 rate-limits. Keys are matched exactly against lowercased query keys,
 # so /faq paths or ?lang= params are unaffected.
-_SEARCH_QUERY_KEYS = frozenset({"q", "s", "search", "searchterm", "query", "zoek", "zoeken", "zoekterm"})
+_SEARCH_QUERY_KEYS = frozenset({"q", "s", "search", "searchterm", "query", "zoek", "zoeken", "zoekterm", "cpath", "products_id", "page", "f[0]", "f[1]", "f[2]", "f[3]", "f[4]", "f[5]"})
 
 
 def _brand_label(entry: str) -> str:
@@ -45,7 +45,7 @@ class HesitantSpider(scrapy.Spider):
 
     custom_settings = {
         "USER_AGENT": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36",
-        "AUTOTHROTTLE_ENABLED": True,
+        "AUTOTHROTTLE_ENABLED": False,
         "AUTOTHROTTLE_START_DELAY": 1.0,
         "AUTOTHROTTLE_MAX_DELAY": 10.0,
         "AUTOTHROTTLE_TARGET_CONCURRENCY": 4.0,
@@ -82,6 +82,7 @@ class HesitantSpider(scrapy.Spider):
         output_file: str = "output.parquet",  # Output file name
         max_jumps: int = 1,  # Maximum site-to-site jumps
         timeout: int = 3600,  # max time in seconds
+        worker_id: int | None = None,  # process id; used for slow-lane assignment
         allowed_languages: List[str] = ["en", "en-us", "en-gb", "en-uk"],  # Allowed languages within url paths
         allowed_countries: List[str] = ["nl"],  # Allowed country prefixes within url paths (e.g. /nl/)
         schema_keywords: List[str] = [],  # Schema.org keywords to look for 
@@ -96,11 +97,13 @@ class HesitantSpider(scrapy.Spider):
         playwright_set_content_timeout_ms: int | None = None,  # set_content timeout; short = fail fast to navigation
         playwright_wait_time: float | None = None,  # adaptive post-load wait cap (s)
         playwright_fetch_timeout: int | None = None,  # absolute per-fetch ceiling (s)
+        playwright_max_fetches_per_context: int | None = None,  # recycle browser after N fetches
         playwright_render_from_body: bool = False,  # render already-fetched HTML (one host fetch/page)
         *args, **kwargs
     ):
         super(HesitantSpider, self).__init__(*args, **kwargs)
 
+        self.worker_id = worker_id
         # Set and log attributes
         self.start_urls = start_urls
         self.logger.info(f"Init start_urls: {self.start_urls}")
@@ -175,6 +178,8 @@ class HesitantSpider(scrapy.Spider):
             fetcher_kwargs["wait_time"] = float(playwright_wait_time)
         if playwright_fetch_timeout is not None:
             fetcher_kwargs["fetch_timeout"] = int(playwright_fetch_timeout)
+        if playwright_max_fetches_per_context is not None:
+            fetcher_kwargs["max_fetches_per_context"] = int(playwright_max_fetches_per_context)
         # Every browser navigation (initial or fallback) is paced through the shared
         # politeness store, so the render channel is not an un-policed host channel.
         fetcher_kwargs["pace"] = self._pace_url
@@ -328,17 +333,16 @@ class HesitantSpider(scrapy.Spider):
         })
 
         out = self.output_file.replace(".parquet", f"_{self.batch_counter}.parquet")
+        def _done(fut):
+            try:
+                fut.result()
+            except Exception as e:
+                self.logger.error(f"Failed saving batch {self.batch_counter} to {out}: {e}")
         try:
             future = self._save_executor.submit(lambda d=df, o=out: d.to_parquet(o))
-            future.result(timeout=120)
-        except TimeoutError as e:
-            self.logger.error(f"Timed out saving batch {self.batch_counter} to {out}: {e}")
+            future.add_done_callback(_done)
         except Exception as e:
-            self.logger.error(f"Failed to save batch {self.batch_counter} to {out}: {e}")
-            try:
-                df.to_parquet(out)
-            except Exception as e2:
-                self.logger.error(f"Fallback save also failed: {e2}")
+            self.logger.error(f"Could not submit save for batch {self.batch_counter}: {e}")
 
         self.batch_counter += 1
         self.total_saved += len(self.batch)
@@ -653,9 +657,25 @@ class HesitantSpider(scrapy.Spider):
         (render_from_body) when we do.
         """
         url = response.url
+        t0 = time.monotonic()
         if self._render_from_body and getattr(response, "body", None):
-            return await self._fetcher.render(url, html=response.body)
-        return await self._fetcher.fetch(url)
+            content = await self._fetcher.render(url, html=response.body)
+        else:
+            content = await self._fetcher.fetch(url)
+        elapsed = time.monotonic() - t0
+        if elapsed >= 10.0:
+            store = self._get_shared_store()
+            if store is not None:
+                try:
+                    from src.scrape.sqlite_scheduler import site_domain
+                    domain = site_domain(url)
+                    if domain:
+                        blocked = await asyncio.to_thread(store.note_slow, domain, elapsed)
+                        if blocked:
+                            self.logger.info(f"slow_host_blocked domain={domain} elapsed={elapsed:.1f}s")
+                except Exception:
+                    pass
+        return content
 
     async def _pace_url(self, url):
         """Await the shared per-domain politeness interval before a navigation."""
@@ -804,10 +824,21 @@ class HesitantSpider(scrapy.Spider):
         else:
             self.logger.debug(f"Sitemap {response.url} yielded {len(urls)} urls")
 
+        if sitemap_domain and sitemap_domain not in self._sitemap_pages_used:
+            try:
+                store = self._get_shared_store()
+                if store is not None:
+                    granted = store.reserve_sitemap(sitemap_domain, int(self.sitemap_page_budget or 0))
+                else:
+                    granted = int(self.sitemap_page_budget or 0)
+            except Exception:
+                granted = int(self.sitemap_page_budget or 0)
+            self._sitemap_pages_used[sitemap_domain] = int(granted)
+
         count = 0
         sitemap_depth = int(response.meta.get("sitemap_depth") or 0)
         pages_used = self._sitemap_pages_used.get(sitemap_domain, 0)
-        budget_exhausted = self.sitemap_page_budget and pages_used >= self.sitemap_page_budget
+        budget_exhausted = bool(self.sitemap_page_budget and pages_used <= 0)
 
         for url in urls:
             url = normalize_url(url)
@@ -817,6 +848,14 @@ class HesitantSpider(scrapy.Spider):
             if self._closing():
                 return
             is_nested_sitemap = url.lower().endswith('.xml')
+
+            # Sitemap "pages" here are not page titles; only accept sitemap URL
+            # entries that also match the configured target netloc/path keywords.
+            # This keeps crawler indexes and product grids out of the scheduler.
+            if not is_nested_sitemap and not self.url_matches_keywords(
+                url, self._re_netloc, self._re_path
+            )[0]:
+                continue
 
             # Stop following a sitemap index once the page-url budget is spent
             if budget_exhausted and is_nested_sitemap:
@@ -844,20 +883,20 @@ class HesitantSpider(scrapy.Spider):
                 count += 1
                 continue
 
-            # Page url: charge it against the per-domain budget
+            # Page url: keep a process-local budget count while the global
+            # reservation holds the cross-worker total.
             if self.sitemap_page_budget:
-                pages_used += 1
-                self._sitemap_pages_used[sitemap_domain] = pages_used
-                if pages_used > self.sitemap_page_budget and sitemap_domain not in self._sitemap_budget_warned:
-                    self._sitemap_budget_warned.add(sitemap_domain)
-                    self.logger.warning(
-                        f"Sitemap page budget reached for {sitemap_domain} "
-                        f"({self.sitemap_page_budget} urls, sitemap_page_budget); "
-                        f"skipping further sitemap urls for this domain"
-                    )
-                if pages_used > self.sitemap_page_budget:
+                if pages_used <= 0:
+                    if sitemap_domain not in self._sitemap_budget_warned:
+                        self._sitemap_budget_warned.add(sitemap_domain)
+                        self.logger.warning(
+                            f"Sitemap page budget reached for {sitemap_domain} "
+                            f"({self.sitemap_page_budget} urls, sitemap_page_budget); "
+                            f"skipping further sitemap urls for this domain"
+                        )
                     continue
-                budget_exhausted = pages_used >= self.sitemap_page_budget
+                pages_used -= 1
+                self._sitemap_pages_used[sitemap_domain] = pages_used
 
             yield scrapy.Request(
                 url=url,
@@ -869,10 +908,25 @@ class HesitantSpider(scrapy.Spider):
             if count % self.sitemap_batch_size == 0:
                 self.logger.debug(f"Sitemap {response.url}: enqueued {count} after filtering")
 
-
     def handle_error(self, failure):
         # TODO pass some specific errors to info?
         self.logger.debug(f"Error encountered: {failure}")
+        request = getattr(failure, "request", None)
+        if request is None:
+            return
+        if request.meta.get("_requeued"):
+            return
+        store = self._get_shared_store()
+        if store is None:
+            return
+        from src.scrape.sqlite_scheduler import QID
+        qid = request.meta.get(QID)
+        if qid is None:
+            return
+        try:
+            store.ack(qid)
+        except Exception:
+            pass
 
     # Called when the spider closes cleanly
     async def closed(self, reason):

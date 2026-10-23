@@ -56,7 +56,7 @@ def spawn_spider_process(urls, netloc_keywords, path_keywords, skip_domains, pro
         "CONCURRENT_REQUESTS": 32,
         "CONCURRENT_REQUESTS_PER_DOMAIN": 6,  # per-domain ceiling; the shared global politeness store bounds whole-fleet host load
         "DOWNLOAD_DELAY": 0,
-        "AUTOTHROTTLE_ENABLED": True,
+        "AUTOTHROTTLE_ENABLED": False,
         "AUTOTHROTTLE_START_DELAY": 1.0,
         "AUTOTHROTTLE_MAX_DELAY": 10.0,
         "AUTOTHROTTLE_TARGET_CONCURRENCY": 4.0,
@@ -108,6 +108,9 @@ def spawn_spider_process(urls, netloc_keywords, path_keywords, skip_domains, pro
         settings["SHARED_QUEUE_LEASE"] = float(shared_queue_cfg.get("lease_seconds", 900))
         settings["SHARED_QUEUE_MAX_ATTEMPTS"] = int(shared_queue_cfg.get("max_attempts", 3))
         settings["SHARED_QUEUE_IDLE_BEFORE_CLOSE"] = float(shared_queue_cfg.get("idle_before_close", 60))
+        settings["DOWNLOADER_MIDDLEWARES"][
+            "src.scrape.BlockedHostMiddleware.BlockedHostMiddleware"
+        ] = 90
         print(f"Shared queue enabled: {store_path}")
 
     if politeness_enabled:
@@ -123,6 +126,11 @@ def spawn_spider_process(urls, netloc_keywords, path_keywords, skip_domains, pro
         print(
             f"Politeness enabled: domain_concurrency={settings['SHARED_QUEUE_DOMAIN_CONCURRENCY']} "
             f"min_interval={settings['POLITENESS_MIN_INTERVAL']}s store={store_path}"
+        )
+
+    if shared_enabled:
+        settings["SHARED_QUEUE_MAX_QUEUED_PER_DOMAIN"] = int(
+            (shared_queue_cfg or {}).get("max_queue_urls_per_domain", 10000)
         )
 
     if jobdir:
@@ -209,12 +217,14 @@ def spawn_spider_process(urls, netloc_keywords, path_keywords, skip_domains, pro
             "blog", "media", "articles", "profile", "legal",
             "tos", "products", "winkel", "winkelwagen", "archief",
             "nieuws", "artikelen", "artikel", "producten", "faq", "policies",
-            "downloads", "portfolio"
+            "downloads", "portfolio", "verhalen", "collegas", "event", "testimonial",
+            "client", "product", "download"
         ],
         allowed_languages=["nl", "en", "en-uk", "en-gb", "nl-nl", "en-nl", "nl-en"],
         allowed_countries=crawl_allowed_countries,
         schema_keywords=schema_keywords,
         timeout=crawl_timeout,  # per-worker wall-clock budget (crawl.max_duration)
+        worker_id=process_id,
         sitemap_max_urls=sitemap_max_urls,
         max_sitemap_depth=crawl_max_sitemap_depth,
         sitemap_page_budget=crawl_sitemap_page_budget,
@@ -224,6 +234,7 @@ def spawn_spider_process(urls, netloc_keywords, path_keywords, skip_domains, pro
         playwright_set_content_timeout_ms=_pw("set_content_timeout_ms"),
         playwright_wait_time=_pw("wait_time"),
         playwright_fetch_timeout=_pw("fetch_timeout"),
+        playwright_max_fetches_per_context=_pw("max_fetches_per_context"),
         playwright_render_from_body=bool(_pw("render_from_body", False)),
     )
 
@@ -323,13 +334,12 @@ if __name__ == "__main__":
                 f"{dir_results}/{time_part}_worker_{i}.parquet",  # Different output files per worker
                 [CONFIG.crawl.schema.keyword],
                 f"{jobdir_root}/worker_{i}" if jobdir_root else None,
-                20000,
+                int(CONFIG.crawl.get("sitemap_max_urls", 2000)),
                 jump_netloc_keywords,
                 jump_path_keywords,
                 use_jump_whitelist,
             )
         )
-
     print("# Workers:", num_workers)
 
     start_time = time.perf_counter()

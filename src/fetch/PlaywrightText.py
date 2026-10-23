@@ -1,8 +1,10 @@
 import asyncio
 import logging
+import time
 from typing import Union
+from urllib.parse import urlparse
 
-from playwright.async_api import async_playwright, Error as PlaywrightError
+from playwright.async_api import async_playwright, Error as PlaywrightError, TimeoutError as PlaywrightTimeoutError
 
 
 class PlaywrightTextFetcher:
@@ -19,13 +21,14 @@ class PlaywrightTextFetcher:
             self,
             user_agent: str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/120.0.0.0",
             max_retries=2,
-            wait_time=1.5,
+            wait_time=0.0,
             max_concurrent_pages: int = 4,
-            max_fetches_per_context: int = 1000,
+            max_fetches_per_context: int = 5000,
             close_timeout: int = 10,
-            fetch_timeout: int = 90,
-            goto_timeout_ms: int = 20000,
-            set_content_timeout_ms: int = 3000,
+            page_close_timeout: float = 3.0,
+            fetch_timeout: int = 30,
+            goto_timeout_ms: int = 8000,
+            set_content_timeout_ms: int = 8000,
             pace=None):
         logging.debug("Initializing PlaywrightTextFetcher (pooled)")
         self.user_agent = user_agent
@@ -49,6 +52,13 @@ class PlaywrightTextFetcher:
         # Cap each teardown step so a wedged Playwright close cannot block the reactor
         # indefinitely (it previously left workers hung for hours at shutdown)
         self.close_timeout = close_timeout
+        # A page close must never hold a render slot for minutes. When it does,
+        # count it and force a context recycle so leaked pages cannot accumulate.
+        self.page_close_timeout = float(page_close_timeout)
+        self._close_timeout_count = 0
+        self._max_close_timeouts = 10
+        self._force_recycle = False
+        self._max_live_pages = 20
         # Absolute ceiling per fetch so a dead browser page cannot pin a
         # semaphore slot and _inflight forever
         self.fetch_timeout = fetch_timeout
@@ -57,6 +67,9 @@ class PlaywrightTextFetcher:
         self._semaphore: asyncio.Semaphore | None = None
         self._fetch_count = 0
         self._inflight = 0
+        self._render_total = 0
+        self._fallback_count = 0
+        self._fallback_hosts = {}
         self._recycle_lock = asyncio.Lock()
 
         self.setup_playwright = False
@@ -150,14 +163,31 @@ class PlaywrightTextFetcher:
         self.setup_playwright = False
         logging.info("Playwright browser closed.")
 
+    async def _safe_close_page(self, page) -> bool:
+        """Close a page under a hard bound; False means the page may have leaked."""
+        try:
+            await asyncio.wait_for(page.close(run_before_unload=False), timeout=self.page_close_timeout)
+            return True
+        except Exception:
+            self._close_timeout_count += 1
+            if self._close_timeout_count >= self._max_close_timeouts:
+                self._force_recycle = True
+            return False
+
     async def _maybe_recycle(self):
         """Swap in a fresh browser+context once a context has served
         max_fetches_per_context fetches, so per-domain state cannot accumulate
         without bound over a long run."""
-        if self.max_fetches_per_context is None or self._fetch_count < self.max_fetches_per_context:
+        live_pages = len(self._context.pages) if self._context is not None else 0
+        overflow = live_pages > self._max_live_pages
+        due = self._force_recycle or overflow
+        if not due and (self.max_fetches_per_context is None or self._fetch_count < self.max_fetches_per_context):
             return
         async with self._recycle_lock:
-            if self._fetch_count < self.max_fetches_per_context:
+            live_pages = len(self._context.pages) if self._context is not None else 0
+            overflow = live_pages > self._max_live_pages
+            due = self._force_recycle or overflow
+            if not due and (self.max_fetches_per_context is None or self._fetch_count < self.max_fetches_per_context):
                 return
             # Wait for in-flight pages to close before swapping the context. Called
             # with no semaphore slot held, so the wait can actually reach zero.
@@ -168,13 +198,19 @@ class PlaywrightTextFetcher:
                 waited += 0.2
             if self._inflight > 0:
                 logging.warning("Recycling context with %d fetches still in-flight", self._inflight)
-            logging.info(f"Recycling Playwright context after {self._fetch_count} fetches")
+            logging.info(
+                f"Recycling Playwright context after {self._fetch_count} fetches "
+                f"(force={self._force_recycle}, live_pages={live_pages}, close_timeouts={self._close_timeout_count})"
+            )
+            _t0 = time.monotonic()
             await self.close()
             self._fetch_count = 0
             # _recycle_lock is held here and is not reentrant, so bypass the
             # locking wrapper and launch directly
             await self._launch_browser()
-            logging.info("Playwright context recycled")
+            self._force_recycle = False
+            self._close_timeout_count = 0
+            logging.info(f"Playwright context recycled in {time.monotonic() - _t0:.1f}s")
 
     async def fetch(self, url: str) -> Union[str, dict]:
         """Fetch content for url by navigating to it (network fetch)."""
@@ -255,8 +291,28 @@ class PlaywrightTextFetcher:
             page = await self._context.new_page()
             # Faster than full networkidle; adaptive wait below handles JS
             if html is not None:
-                await page.set_content(self._with_base(html, url), wait_until="domcontentloaded",
-                                       timeout=self.set_content_timeout_ms)
+                self._render_total += 1
+                try:
+                    await page.set_content(self._with_base(html, url), wait_until="commit",
+                                           timeout=2000)
+                except Exception:
+                    self._fallback_count += 1
+                    host = urlparse(url).netloc.lower()
+                    self._fallback_hosts[host] = self._fallback_hosts.get(host, 0) + 1
+                    logging.debug(f"playwright_set_content_fallback netloc={host} url={url}")
+                    try:
+                        from src.parse.HTML import HTMLBodyParser
+                        return HTMLBodyParser().parse(html)
+                    except Exception:
+                        return ""
+                if self._render_total % 100 == 0:
+                    top = sorted(self._fallback_hosts.items(), key=lambda kv: -kv[1])[:5]
+                    rate = 100.0 * self._fallback_count / self._render_total
+                    logging.info(
+                        f"render_fallback_stats total={self._render_total} "
+                        f"fallbacks={self._fallback_count} rate={rate:.1f}% top={top}"
+                    )
+                await asyncio.sleep(0.1)
             else:
                 if self._pace is not None:
                     try:
@@ -264,17 +320,7 @@ class PlaywrightTextFetcher:
                     except Exception:
                         pass
                 await page.goto(url, wait_until="domcontentloaded", timeout=self.goto_timeout_ms)
-            # Adaptive wait: try networkidle briefly, fallback to short sleep
-            try:
-                await page.wait_for_load_state("networkidle", timeout=int(self.wait_time * 1000))
-            except Exception:
-                # JS-heavy sites may never reach idle; wait for body instead
-                try:
-                    await page.wait_for_selector("body", timeout=3000)
-                except Exception:
-                    pass
-                # minimal extra dwell for late XMLHTTPRequest
-                await asyncio.sleep(min(self.wait_time, 1.0))
+            # No adaptive networkidle wait: it stalls Playwright on JS-heavy pages.
 
             text_content = await self._extract_clean_text(page)
             # set_content skips the host navigation but can under-render JS-heavy
@@ -283,14 +329,11 @@ class PlaywrightTextFetcher:
             # a real navigation. Costs only local render time, not an extra host hit
             # for the fallback's own attempt (it does navigate once, like the old
             # behaviour) - so no worse than before for those pages.
-            if html is not None and retries < self.max_retries:
-                raw_len = len(html)
-                if len(text_content) < max(200, 0.01 * raw_len):
-                    logging.debug("set_content under-rendered %s (%d chars); retrying via navigation",
-                                  url, len(text_content))
-                    return await self._fetch_with_retries(url, retries + 1, html=None)
             return text_content
 
+        except PlaywrightTimeoutError as e:
+            logging.debug(f"Playwright timeout for {url} (no retry): {e}")
+            return ""
         except (PlaywrightError, Exception) as e:
             logging.warning(f"Playwright request failed for {url} (try {retries+1}/{self.max_retries+1}): {e}")
             if retries < self.max_retries:
@@ -304,24 +347,14 @@ class PlaywrightTextFetcher:
             return ""
         finally:
             if page is not None:
-                try:
-                    await page.close()
-                except Exception:
-                    pass
+                await self._safe_close_page(page)
 
     async def _extract_clean_text(self, page) -> str:
-        noise_selectors = ["nav", "footer", "header", "aside"]
-        for selector in noise_selectors:
-            try:
-                await page.evaluate(f'document.querySelectorAll("{selector}").forEach(el => el.remove())')
-            except Exception:
-                pass
         try:
-            text = await page.inner_text("body")
+            text = await page.inner_text("body", timeout=5000)
         except Exception:
-            # fallback to content extraction via evaluate
             try:
-                text = await page.evaluate("() => document.body.innerText || ''")
+                text = await page.evaluate("() => document.body ? (document.body.innerText || '') : ''")
             except Exception:
                 return ""
         lines = [line.strip() for line in text.splitlines() if line.strip()]

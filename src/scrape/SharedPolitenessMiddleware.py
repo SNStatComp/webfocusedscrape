@@ -97,6 +97,35 @@ class SharedPolitenessMiddleware:
             await asyncio.to_thread(self.store.note_success, domain)
         return response
 
+    async def process_exception(self, request, exception, spider):
+        """Block broken hosts before RetryMiddleware spends more attempts.
+
+        Runs at priority 590 (RetryMiddleware is 550), so in the descending
+        process_exception order this sees the failure first.
+        """
+        if self.store is None:
+            return None
+        name = type(exception).__name__.lower()
+        permanent = any(k in name for k in ("dns", "ssl", "tls", "connectionrefused"))
+        transient = any(k in name for k in ("timeout", "connectionlost", "connectiondone", "connectionclosed"))
+        if not permanent and not transient:
+            return None
+        domain = site_domain(request.url)
+        if not domain:
+            return None
+        try:
+            blocked = await asyncio.to_thread(self.store.note_failure, domain, permanent)
+        except Exception:
+            return None
+        if blocked:
+            request.meta["dont_retry"] = True
+            logger.info(
+                "download_failure_blocked domain=%s kind=%s",
+                domain,
+                "permanent" if permanent else "transient",
+            )
+        return None
+
     def _on_spider_closed(self, spider, reason):
         logger.info(
             "politeness: paced=%d total_wait=%.1fs backoff_events=%d",

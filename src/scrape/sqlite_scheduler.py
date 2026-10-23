@@ -96,7 +96,16 @@ CREATE TABLE IF NOT EXISTS content_seen (
 CREATE TABLE IF NOT EXISTS domain_state (
     domain TEXT PRIMARY KEY,
     next_at REAL NOT NULL DEFAULT 0,
-    penalty REAL NOT NULL DEFAULT 0
+    penalty REAL NOT NULL DEFAULT 0,
+    blocked_until REAL NOT NULL DEFAULT 0,
+    slow_count INTEGER NOT NULL DEFAULT 0,
+    slow_since REAL NOT NULL DEFAULT 0,
+    fail_count INTEGER NOT NULL DEFAULT 0,
+    fail_since REAL NOT NULL DEFAULT 0
+);
+CREATE TABLE IF NOT EXISTS sitemap_budget (
+    domain TEXT PRIMARY KEY,
+    used INTEGER NOT NULL DEFAULT 0
 );
 """
 
@@ -121,13 +130,21 @@ class SharedStore:
     queued.
     """
 
-    def __init__(self, path, lease_seconds=900.0, max_attempts=3, idle_before_close=60.0, domain_concurrency=0):
+    def __init__(self, path, lease_seconds=900.0, max_attempts=3, idle_before_close=60.0, domain_concurrency=0, max_queued_per_domain=10000):
         self.path = path
         self.lease_seconds = float(lease_seconds)
         self.max_attempts = int(max_attempts)
         self.idle_before_close = float(idle_before_close)
         # 0 disables the per-domain concurrency cap (plain shared queue).
         self.domain_concurrency = int(domain_concurrency)
+        # Pre-dispatch deferral: do not claim a host whose next slot is further
+        # away than this; the worker should process another host instead.
+        self.defer_horizon = 5.0
+        # 4 of 16 workers are the slow lane; genuine slow hosts are isolated there.
+        self.slow_lane_mod = 4
+        self.slow_penalty_threshold = 1.0
+        # Prevent one site from adding an effectively unbounded backlog.
+        self.max_queued_per_domain = int(max_queued_per_domain)
         self._idle_since = None
         self._lock = threading.Lock()
         # isolation_level=None -> autocommit; transactions are issued explicitly.
@@ -139,7 +156,7 @@ class SharedStore:
         # (it reached multiple GB in a long run because checkpoints were starved).
         self.conn.execute("PRAGMA journal_size_limit=67108864")
         self._commits = 0
-        self._checkpoint_every = 1000
+        self._checkpoint_every = 1000000
         # Fast-path dedup for fingerprints this worker already enqueued. The DB
         # seen table still dedups across workers, but the common case is the same
         # link repeated across many pages of one site; without this every repeat
@@ -151,14 +168,30 @@ class SharedStore:
         self.ENQUEUE_BATCH = 200
         self._enqueue_buffer = []
         self._ack_buffer = []
+        # A process-local lease reservoir. claim() returns one request so Scrapy
+        # can fetch, but the SQLite transaction can safely reserve a batch.
+        self.LEASE_BATCH = 64
+        self._pending_leases = []
         self.conn.executescript(_SCHEMA)
         # Migrate a queue table created before the domain column existed.
         cols = {row[1] for row in self.conn.execute("PRAGMA table_info(queue)")}
         if "domain" not in cols:
             self.conn.execute("ALTER TABLE queue ADD COLUMN domain TEXT")
             self.conn.execute("CREATE INDEX IF NOT EXISTS queue_domain ON queue (domain, lease_until)")
+        dcols = {row[1] for row in self.conn.execute("PRAGMA table_info(domain_state)")}
+        if "blocked_until" not in dcols:
+            self.conn.execute("ALTER TABLE domain_state ADD COLUMN blocked_until REAL NOT NULL DEFAULT 0")
+        if "slow_count" not in dcols:
+            self.conn.execute("ALTER TABLE domain_state ADD COLUMN slow_count INTEGER NOT NULL DEFAULT 0")
+        if "slow_since" not in dcols:
+            self.conn.execute("ALTER TABLE domain_state ADD COLUMN slow_since REAL NOT NULL DEFAULT 0")
+        if "fail_count" not in dcols:
+            self.conn.execute("ALTER TABLE domain_state ADD COLUMN fail_count INTEGER NOT NULL DEFAULT 0")
+        if "fail_since" not in dcols:
+            self.conn.execute("ALTER TABLE domain_state ADD COLUMN fail_since REAL NOT NULL DEFAULT 0")
+        self.release_expired_leases()
 
-    # -- transaction helper -------------------------------------------------
+        # -- transaction helper -------------------------------------------------
     def _tx(self, fn):
         """Run ``fn(conn)`` inside BEGIN IMMEDIATE, retrying on lock contention.
 
@@ -181,24 +214,25 @@ class SharedStore:
                     raise
                 try:
                     result = fn(self.conn)
-                    self.conn.execute("COMMIT")
+                    try:
+                        self.conn.execute("COMMIT")
+                    except sqlite3.OperationalError:
+                        pass
                     self._commits += 1
-                    # Periodic TRUNCATE checkpoint bounds the WAL. It waits (up to
-                    # busy_timeout) for the other workers' short read snapshots to
-                    # clear, then resets the WAL file. Reads are serialized with
-                    # writes per connection, so no snapshot is left open to starve
-                    # this. Fall back to PASSIVE if TRUNCATE cannot get its turn.
+                    # Periodic checkpoint bounds the WAL without blocking the
+                    # fleet: TRUNCATE waits for readers and can stall every worker,
+                    # while PASSIVE returns immediately and leaves readers alone.
                     if self._commits % self._checkpoint_every == 0:
                         try:
-                            self.conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+                            self.conn.execute("PRAGMA wal_checkpoint(PASSIVE)")
                         except sqlite3.Error:
-                            try:
-                                self.conn.execute("PRAGMA wal_checkpoint(PASSIVE)")
-                            except sqlite3.Error:
-                                pass
+                            pass
                     return result
                 except Exception:
-                    self.conn.execute("ROLLBACK")
+                    try:
+                        self.conn.execute("ROLLBACK")
+                    except sqlite3.OperationalError:
+                        pass
                     raise
             raise last
 
@@ -244,7 +278,21 @@ class SharedStore:
         def txn(conn):
             for qid in acks:
                 conn.execute("DELETE FROM queue WHERE id=?", (qid,))
+            domain_counts = {
+            domain: conn.execute("SELECT COUNT(*) FROM queue WHERE domain=?", (domain,)).fetchone()[0]
+            for domain in {item[3] for item in enq if item[3]}
+        }
+            queued_this_flush = {}
             for fp, prio, blob, domain, qid, internal in enq:
+                charged = (
+                    bool(self.max_queued_per_domain)
+                    and (not qid)
+                    and domain
+                )
+                if charged and internal is False:
+                    count_after_existing = domain_counts.get(domain, 0) + queued_this_flush.get(domain, 0)
+                    if count_after_existing >= self.max_queued_per_domain:
+                        continue
                 newly = conn.execute(
                     "INSERT OR IGNORE INTO seen(fingerprint) VALUES (?)", (fp,)
                 ).rowcount == 1
@@ -265,6 +313,8 @@ class SharedStore:
                     "VALUES (?, ?, ?, 0, NULL, ?)",
                     (fp, prio, blob, domain),
                 )
+                if charged and internal is False:
+                    queued_this_flush[domain] = queued_this_flush.get(domain, 0) + 1
 
         try:
             self._tx(txn)
@@ -276,66 +326,101 @@ class SharedStore:
 
     # -- claim --------------------------------------------------------------
     def claim(self, spider):
-        self._flush_enqueues()
-        now = time.time()
-        deadline = now + self.lease_seconds
-        cap = self.domain_concurrency
+        if not self._pending_leases:
+            self._flush_enqueues()
+            now = time.time()
+            deadline = now + self.lease_seconds
+            cap = self.domain_concurrency
 
-        def txn(conn):
-            # 1. Recover an expired lease first (crash or missed ack). Expired rows
-            #    are not in the partial idle index, so use the non-partial
-            #    queue_claim index; this path is rare and cheap.
-            row = conn.execute(
-                "SELECT id, attempts, request FROM queue "
-                "WHERE lease_until IS NOT NULL AND lease_until < ? "
-                "ORDER BY priority DESC, id ASC LIMIT 1",
-                (now,),
-            ).fetchone()
-            if row is not None:
-                qid, attempts, blob = row
-                attempts += 1
-                if attempts >= self.max_attempts:
-                    conn.execute("DELETE FROM queue WHERE id=?", (qid,))
-                    # Fall through and try a fresh idle row instead of returning.
-                else:
-                    conn.execute(
-                        "UPDATE queue SET lease_until=?, attempts=? WHERE id=?",
-                        (deadline, attempts, qid),
+            def txn(conn):
+                batch = []
+                leased = 0
+
+                # Recover expired leases in a batch. Recovering one per claim
+                # let thousands of rows sit in limbo after a failure storm.
+                expired = conn.execute(
+                    "SELECT id, attempts, request FROM queue "
+                    "WHERE lease_until IS NOT NULL AND lease_until < ? "
+                    "ORDER BY priority DESC, id ASC LIMIT ?",
+                    (now, self.LEASE_BATCH),
+                ).fetchall()
+                for qid, attempts, blob in expired:
+                    attempts += 1
+                    if attempts >= self.max_attempts:
+                        conn.execute("DELETE FROM queue WHERE id=?", (qid,))
+                    else:
+                        conn.execute(
+                            "UPDATE queue SET lease_until=?, attempts=? WHERE id=?",
+                            (deadline, attempts, qid),
+                        )
+                        batch.append((qid, blob))
+
+                remaining = self.LEASE_BATCH - len(batch)
+                if remaining > 0:
+                    worker_id = getattr(spider, "worker_id", None)
+                    slow_lane = worker_id is not None and worker_id % self.slow_lane_mod == 0
+                    threshold = self.slow_penalty_threshold
+
+                    def run(sql, limit):
+                        if cap and cap > 0:
+                            params = (now, now + self.defer_horizon, now, cap, threshold, limit)
+                        else:
+                            params = (now, now + self.defer_horizon, threshold, limit)
+                        return conn.execute(sql, params).fetchall()
+
+                    lease_cap_sql = ""
+                    if cap and cap > 0:
+                        lease_cap_sql = (
+                            "AND (domain IS NULL OR domain NOT IN ("
+                            "    SELECT domain FROM queue INDEXED BY queue_lease_domain "
+                            "    WHERE lease_until > ? GROUP BY domain HAVING COUNT(*) >= ?)) "
+                        )
+                    common_sql = (
+                        "SELECT id, attempts, request FROM queue INDEXED BY queue_idle "
+                        "WHERE lease_until IS NULL "
+                        "AND (domain IS NULL OR domain NOT IN ("
+                        "    SELECT domain FROM domain_state WHERE blocked_until > ?)) "
+                        "AND (domain IS NULL OR domain NOT IN ("
+                        "    SELECT domain FROM domain_state WHERE next_at > ?)) "
+                        + lease_cap_sql
                     )
-                    return qid, blob
+                    fast_sql = common_sql + (
+                        "AND (domain IS NULL OR domain NOT IN ("
+                        "    SELECT domain FROM domain_state WHERE penalty >= ? OR slow_count > 0)) "
+                        "ORDER BY priority DESC, id ASC LIMIT ?"
+                    )
+                    slow_sql = common_sql + (
+                        "AND (domain IS NOT NULL AND domain IN ("
+                        "    SELECT domain FROM domain_state WHERE penalty >= ? OR slow_count > 0)) "
+                        "ORDER BY priority DESC, id ASC LIMIT ?"
+                    )
+                    if slow_lane:
+                        rows = run(slow_sql, remaining)
+                        if len(rows) < remaining:
+                            rows.extend(run(fast_sql, remaining - len(rows)))
+                    else:
+                        rows = run(fast_sql, remaining)
+                        # Only when the fast lane is empty do fast workers help the slow lane.
+                        if not rows:
+                            rows = run(slow_sql, remaining)
+                    for qid, attempts, blob in rows:
+                        conn.execute(
+                            "UPDATE queue SET lease_until=?, attempts=? WHERE id=?",
+                            (deadline, attempts + 1, qid),
+                        )
+                        batch.append((qid, blob))
 
-            # 2. Fresh idle row. INDEXED BY queue_idle keeps this an ordered index
-            #    scan (no full-queue scan, no temp-B-tree sort) even with the
-            #    domain-cap NOT IN filter. The cap subquery only touches live
-            #    leases, so its cost is bounded by in-flight rows, not queue size.
-            if cap and cap > 0:
-                row = conn.execute(
-                    "SELECT id, attempts, request FROM queue INDEXED BY queue_idle "
-                    "WHERE lease_until IS NULL AND (domain IS NULL OR domain NOT IN ("
-                    "    SELECT domain FROM queue INDEXED BY queue_lease_domain "
-                    "    WHERE lease_until > ? GROUP BY domain HAVING COUNT(*) >= ?)) "
-                    "ORDER BY priority DESC, id ASC LIMIT 1",
-                    (now, cap),
-                ).fetchone()
+                return batch or None
+
+            result = self._tx(txn)
+            if result:
+                self._pending_leases.extend(result)
             else:
-                row = conn.execute(
-                    "SELECT id, attempts, request FROM queue INDEXED BY queue_idle "
-                    "WHERE lease_until IS NULL "
-                    "ORDER BY priority DESC, id ASC LIMIT 1"
-                ).fetchone()
-            if row is None:
-                return None
-            qid, attempts, blob = row
-            conn.execute(
-                "UPDATE queue SET lease_until=?, attempts=? WHERE id=?",
-                (deadline, attempts, qid),
-            )
-            return qid, blob
+                self._pending_leases = []
 
-        result = self._tx(txn)
-        if result is None:
+        if not self._pending_leases:
             return None
-        qid, blob = result
+        qid, blob = self._pending_leases.pop(0)
         try:
             request = request_from_dict(pickle.loads(blob), spider=spider)
         except Exception as e:
@@ -381,8 +466,8 @@ class SharedStore:
             row = conn.execute(
                 "SELECT next_at, penalty FROM domain_state WHERE domain=?", (domain,)
             ).fetchone()
-            next_at = row[0] if row else 0.0
-            penalty = row[1] if row else 0.0
+            next_at = row[0] if (row and row[0] is not None) else 0.0
+            penalty = row[1] if (row and row[1] is not None) else 0.0
             start = max(now, next_at)
             conn.execute(
                 "INSERT INTO domain_state(domain, next_at, penalty) VALUES (?, ?, ?) "
@@ -401,18 +486,223 @@ class SharedStore:
             row = conn.execute(
                 "SELECT next_at, penalty FROM domain_state WHERE domain=?", (domain,)
             ).fetchone()
-            cur_penalty = row[1] if row else 0.0
-            cur_next = row[0] if row else 0.0
+            cur_penalty = row[1] if (row and row[1] is not None) else 0.0
+            cur_next = row[0] if (row and row[0] is not None) else 0.0
             base = cur_penalty if cur_penalty > 0 else max(min_interval, 1.0)
             new_penalty = min(base * factor, cap)
             new_next = max(cur_next, now + new_penalty)
+            blocked_until = now + 300.0 if new_penalty >= cap else 0.0
             conn.execute(
-                "INSERT INTO domain_state(domain, next_at, penalty) VALUES (?, ?, ?) "
-                "ON CONFLICT(domain) DO UPDATE SET next_at=excluded.next_at, penalty=excluded.penalty",
-                (domain, new_next, new_penalty),
+                "INSERT INTO domain_state(domain, next_at, penalty, blocked_until) VALUES (?, ?, ?, ?) "
+                "ON CONFLICT(domain) DO UPDATE SET next_at=excluded.next_at, penalty=excluded.penalty, "
+                "blocked_until=excluded.blocked_until",
+                (domain, new_next, new_penalty, blocked_until),
             )
 
         self._tx(txn)
+
+    def note_slow(
+        self,
+        domain: str,
+        elapsed: float,
+        now: float | None = None,
+        threshold: float = 10.0,
+        window: float = 600.0,
+        limit: int = 3,
+        cooldown: float = 300.0,
+        factor: float = 2.0,
+        cap: float = 60.0,
+        min_interval: float = 0.25,
+    ) -> bool:
+        """Record a slow render and block the host after repeated events.
+
+        Returns True when this event crossed the limit and set the cooldown.
+        Existing penalty/block state is preserved; only strengthened.
+        """
+        if not domain or elapsed < threshold:
+            return False
+        when = time.time() if now is None else float(now)
+
+        def txn(conn):
+            row = conn.execute(
+                "SELECT next_at, penalty, blocked_until, slow_count, slow_since "
+                "FROM domain_state WHERE domain=?",
+                (domain,),
+            ).fetchone()
+            cur_next = row[0] if (row and row[0] is not None) else 0.0
+            cur_penalty = row[1] if (row and row[1] is not None) else 0.0
+            cur_blocked = row[2] if (row and row[2] is not None) else 0.0
+            count = int(row[3] or 0) if row else 0
+            since = row[4] if (row and row[4] is not None) else 0.0
+            if since <= 0 or when - since > window:
+                count = 0
+                since = when
+            count += 1
+            base = cur_penalty if cur_penalty > 0 else max(min_interval, 1.0)
+            new_penalty = min(base * factor, cap)
+            new_next = max(cur_next, when + new_penalty)
+            blocked = cur_blocked if cur_blocked > when else 0.0
+            hit = count >= limit
+            if hit:
+                blocked = when + cooldown
+                count = 0
+                since = 0.0
+            conn.execute(
+                "INSERT INTO domain_state(domain, next_at, penalty, blocked_until, slow_count, slow_since) "
+                "VALUES (?, ?, ?, ?, ?, ?) "
+                "ON CONFLICT(domain) DO UPDATE SET next_at=excluded.next_at, penalty=excluded.penalty, "
+                "blocked_until=excluded.blocked_until, slow_count=excluded.slow_count, "
+                "slow_since=excluded.slow_since",
+                (domain, new_next, new_penalty, blocked, count, since),
+            )
+            return hit
+
+        hit = bool(self._tx(txn))
+        if hit:
+            self.release_domain_leases(domain)
+        return hit
+
+    def should_defer(self, domain: str, now: float | None = None, horizon: float | None = None) -> bool:
+        """True when a host is blocked or its next slot is beyond the horizon."""
+        if not domain:
+            return False
+        when = time.time() if now is None else float(now)
+        h = self.defer_horizon if horizon is None else float(horizon)
+        try:
+            with self._lock:
+                row = self.conn.execute(
+                    "SELECT next_at, blocked_until FROM domain_state WHERE domain=?", (domain,)
+                ).fetchone()
+        except sqlite3.Error:
+            return False
+        if not row:
+            return False
+        return bool((row[1] or 0) > when or (row[0] or 0) > when + h)
+
+    def is_blocked(self, domain: str, now: float | None = None) -> bool:
+        if not domain:
+            return False
+        when = time.time() if now is None else float(now)
+        try:
+            with self._lock:
+                row = self.conn.execute(
+                    "SELECT blocked_until FROM domain_state WHERE domain=?", (domain,)
+                ).fetchone()
+        except sqlite3.Error:
+            return False
+        return bool(row and (row[0] or 0) > when)
+
+    def release(self, qid) -> None:
+        """Release one claimed row without consuming an attempt."""
+        if qid is None:
+            return
+
+        def txn(conn):
+            conn.execute(
+                "UPDATE queue SET lease_until=NULL, attempts=max(0, attempts-1) WHERE id=?",
+                (qid,),
+            )
+
+        try:
+            self._tx(txn)
+        except Exception:
+            pass
+
+    def release_domain_leases(self, domain: str) -> int:
+        """Release every lease for a host that just became blocked."""
+        if not domain:
+            return 0
+
+        def txn(conn):
+            return conn.execute(
+                "UPDATE queue SET lease_until=NULL, attempts=max(0, attempts-1) "
+                "WHERE domain=? AND lease_until IS NOT NULL",
+                (domain,),
+            ).rowcount
+
+        try:
+            return int(self._tx(txn))
+        except Exception:
+            return 0
+
+    def release_expired_leases(self, now: float | None = None) -> int:
+        """Bulk-release leases that already expired. Attempts are preserved."""
+        when = time.time() if now is None else float(now)
+
+        def txn(conn):
+            return conn.execute(
+                "UPDATE queue SET lease_until=NULL "
+                "WHERE lease_until IS NOT NULL AND lease_until < ?",
+                (when,),
+            ).rowcount
+
+        try:
+            return int(self._tx(txn))
+        except Exception:
+            return 0
+
+    def note_failure(
+        self,
+        domain: str,
+        permanent: bool = False,
+        now: float | None = None,
+        window: float = 600.0,
+        transient_limit: int = 2,
+        cooldown: float = 300.0,
+        cap: float = 60.0,
+        min_interval: float = 0.25,
+    ) -> bool:
+        """Record a terminal download failure; block permanent errors at once.
+
+        Returns True when the host is blocked. Existing block/penalty state is
+        preserved and only strengthened.
+        """
+        if not domain:
+            return False
+        when = time.time() if now is None else float(now)
+
+        def txn(conn):
+            row = conn.execute(
+                "SELECT next_at, penalty, blocked_until, fail_count, fail_since "
+                "FROM domain_state WHERE domain=?",
+                (domain,),
+            ).fetchone()
+            cur_next = row[0] if (row and row[0] is not None) else 0.0
+            cur_penalty = row[1] if (row and row[1] is not None) else 0.0
+            cur_blocked = row[2] if (row and row[2] is not None) else 0.0
+            count = int(row[3] or 0) if row else 0
+            since = row[4] if (row and row[4] is not None) else 0.0
+            if since <= 0 or when - since > window:
+                count = 0
+                since = when
+            if not permanent:
+                count += 1
+            blocked = cur_blocked if cur_blocked > when else 0.0
+            hit = permanent or count >= transient_limit
+            if permanent:
+                new_penalty = cap
+            else:
+                base = cur_penalty if cur_penalty > 0 else max(min_interval, 1.0)
+                new_penalty = min(base * 2, cap)
+            new_next = max(cur_next, when + (cooldown if hit else min_interval))
+            if hit:
+                blocked = when + cooldown
+                count = 0
+                since = 0.0
+            conn.execute(
+                "INSERT INTO domain_state(domain, next_at, penalty, blocked_until, fail_count, fail_since) "
+                "VALUES (?, ?, ?, ?, ?, ?) "
+                "ON CONFLICT(domain) DO UPDATE SET next_at=excluded.next_at, penalty=excluded.penalty, "
+                "blocked_until=excluded.blocked_until, fail_count=excluded.fail_count, "
+                "fail_since=excluded.fail_since",
+                (domain, new_next, new_penalty, blocked, count, since),
+            )
+            return hit
+
+        hit = bool(self._tx(txn))
+        if hit:
+            self.release_domain_leases(domain)
+        return hit
 
     def note_success(self, domain: str) -> None:
         """Halve this domain's backoff penalty after a good response.
@@ -422,17 +712,18 @@ class SharedStore:
         (a shared-queue hot path) in the common case.
         """
         try:
-            row = self.conn.execute(
-                "SELECT penalty FROM domain_state WHERE domain=?", (domain,)
-            ).fetchone()
+            with self._lock:
+                row = self.conn.execute(
+                    "SELECT penalty FROM domain_state WHERE domain=?", (domain,)
+                ).fetchone()
         except sqlite3.Error:
             return
-        if not row or row[0] <= 0:
+        if not row or (row[0] or 0) <= 0:
             return
 
         def txn(conn):
             conn.execute(
-                "UPDATE domain_state SET penalty = penalty / 2 WHERE domain=? AND penalty > 0",
+                "UPDATE domain_state SET penalty = penalty / 2, blocked_until = 0 WHERE domain=? AND penalty > 0",
                 (domain,),
             )
 
@@ -483,6 +774,28 @@ class SharedStore:
             seen = self.conn.execute("SELECT COUNT(*) FROM seen").fetchone()[0]
         return pending, seen
 
+    def reserve_sitemap(self, domain: str, max_pages: int) -> int:
+        """Reserve remaining per-domain sitemap URLs across all workers."""
+        if not domain or max_pages <= 0:
+            return int(max_pages)
+        with self._lock:
+            row = self.conn.execute(
+                "SELECT used FROM sitemap_budget WHERE domain=?", (domain,)
+            ).fetchone()
+            used = int(row[0]) if row else 0
+            granted = max(0, max_pages - used)
+            if granted <= 0:
+                return 0
+            if row is None:
+                self.conn.execute(
+                    "INSERT INTO sitemap_budget(domain, used) VALUES (?, ?)", (domain, used + granted)
+                )
+            else:
+                self.conn.execute(
+                    "UPDATE sitemap_budget SET used = used + ? WHERE domain=?", (granted, domain)
+                )
+            return granted
+
     def close(self):
         try:
             self._flush_enqueues()
@@ -498,7 +811,7 @@ _STORES = {}
 _STORES_LOCK = threading.Lock()
 
 
-def get_store(path, lease_seconds=900.0, max_attempts=3, idle_before_close=60.0, domain_concurrency=0) -> SharedStore:
+def get_store(path, lease_seconds=900.0, max_attempts=3, idle_before_close=60.0, domain_concurrency=0, max_queued_per_domain=10000) -> SharedStore:
     """Process-wide singleton per path, so scheduler and spider share a connection."""
     with _STORES_LOCK:
         store = _STORES.get(path)
@@ -509,6 +822,7 @@ def get_store(path, lease_seconds=900.0, max_attempts=3, idle_before_close=60.0,
                 max_attempts=max_attempts,
                 idle_before_close=idle_before_close,
                 domain_concurrency=domain_concurrency,
+                max_queued_per_domain=max_queued_per_domain,
             )
             _STORES[path] = store
         return store
@@ -531,6 +845,7 @@ class SqliteDupeFilter(BaseDupeFilter):
             max_attempts=crawler.settings.getint("SHARED_QUEUE_MAX_ATTEMPTS", 3),
             idle_before_close=crawler.settings.getfloat("SHARED_QUEUE_IDLE_BEFORE_CLOSE", 60),
             domain_concurrency=crawler.settings.getint("SHARED_QUEUE_DOMAIN_CONCURRENCY", 0),
+            max_queued_per_domain=crawler.settings.getint("SHARED_QUEUE_MAX_QUEUED_PER_DOMAIN", 10000),
         )
         return cls(store, crawler.request_fingerprinter)
 
@@ -568,6 +883,7 @@ class SqliteScheduler(BaseScheduler):
             max_attempts=crawler.settings.getint("SHARED_QUEUE_MAX_ATTEMPTS", 3),
             idle_before_close=crawler.settings.getfloat("SHARED_QUEUE_IDLE_BEFORE_CLOSE", 60),
             domain_concurrency=crawler.settings.getint("SHARED_QUEUE_DOMAIN_CONCURRENCY", 0),
+            max_queued_per_domain=crawler.settings.getint("SHARED_QUEUE_MAX_QUEUED_PER_DOMAIN", 10000),
         )
         return cls(crawler, store)
 
@@ -580,6 +896,7 @@ class SqliteScheduler(BaseScheduler):
     def open(self, spider):
         self.spider = spider
         self.crawler.signals.connect(self._on_response_received, signal=signals.response_received)
+        self.crawler.signals.connect(self._on_request_dropped, signal=signals.request_dropped)
         pending, seen = self.store.counts()
         logger.info(
             "SqliteScheduler open: %s (pending=%d, seen=%d, lease=%ss, max_attempts=%d)",
@@ -589,6 +906,7 @@ class SqliteScheduler(BaseScheduler):
     def close(self, reason):
         try:
             self.crawler.signals.disconnect(self._on_response_received, signal=signals.response_received)
+            self.crawler.signals.disconnect(self._on_request_dropped, signal=signals.request_dropped)
         except Exception:
             pass
         pending, seen = self.store.counts()
@@ -603,6 +921,10 @@ class SqliteScheduler(BaseScheduler):
 
     def has_pending_requests(self) -> bool:
         return self.store.has_pending()
+
+    def _on_request_dropped(self, request, spider):
+        """A dropped enqueue result must not leave its claimed row leased."""
+        self.store.ack(request.meta.get(QID))
 
     def _on_response_received(self, response, request, spider):
         # Every downloaded request carries a freshly claimed id, so this deletes
