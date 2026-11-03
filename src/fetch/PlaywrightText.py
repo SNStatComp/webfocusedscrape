@@ -2,7 +2,11 @@ import asyncio
 import logging
 from typing import Union
 
-from playwright.async_api import async_playwright, Error as PlaywrightError
+from playwright.async_api import (
+    Error as PlaywrightError,
+    TimeoutError as PlaywrightTimeoutError,
+    async_playwright,
+)
 
 
 class PlaywrightTextFetcher:
@@ -22,7 +26,10 @@ class PlaywrightTextFetcher:
             wait_time=1.5,
             max_concurrent_pages: int = 4,
             max_fetches_per_context: int = 1000,
-            close_timeout: int = 10):
+            close_timeout: int = 10,
+            page_close_timeout: float = 3.0,
+            goto_timeout_ms: int = 10000,
+            fetch_timeout: float | None = 30.0):
         logging.debug("Initializing PlaywrightTextFetcher (pooled)")
         self.user_agent = user_agent
         self.max_retries = max_retries
@@ -34,6 +41,13 @@ class PlaywrightTextFetcher:
         # Cap each teardown step so a wedged Playwright close cannot block the reactor
         # indefinitely (it previously left workers hung for hours at shutdown)
         self.close_timeout = close_timeout
+        # A page close must not hold a render slot indefinitely.
+        self.page_close_timeout = float(page_close_timeout)
+        self.goto_timeout_ms = int(goto_timeout_ms)
+        self.fetch_timeout = None if fetch_timeout is None else float(fetch_timeout)
+        self._page_close_timeouts = 0
+        self._max_page_close_timeouts = 3
+        self._force_recycle = False
         # Created once here, never on recycle: rebuilding it mid-flight would strand
         # every coroutine already inside `async with self._semaphore`
         self._semaphore: asyncio.Semaphore | None = None
@@ -103,6 +117,25 @@ class PlaywrightTextFetcher:
         except Exception:
             pass
 
+    async def _safe_close_page(self, page) -> bool:
+        """Close a page under a hard bound; False means the page may have leaked."""
+        try:
+            await asyncio.wait_for(
+                page.close(run_before_unload=False),
+                timeout=self.page_close_timeout,
+            )
+            self._page_close_timeouts = 0
+            return True
+        except Exception:
+            self._page_close_timeouts += 1
+            if self._page_close_timeouts >= self._max_page_close_timeouts:
+                self._force_recycle = True
+            logging.warning(
+                "Playwright page close failed or timed out after %.1fs",
+                self.page_close_timeout,
+            )
+            return False
+
     async def close(self):
         """Properly shuts down the browser and playwright."""
         if self._context:
@@ -121,10 +154,13 @@ class PlaywrightTextFetcher:
         """Swap in a fresh browser+context once a context has served
         max_fetches_per_context fetches, so per-domain state cannot accumulate
         without bound over a long run."""
-        if self.max_fetches_per_context is None or self._fetch_count < self.max_fetches_per_context:
+        if not self._force_recycle and (
+            self.max_fetches_per_context is None
+            or self._fetch_count < self.max_fetches_per_context
+        ):
             return
         async with self._recycle_lock:
-            if self._fetch_count < self.max_fetches_per_context:
+            if not self._force_recycle and self._fetch_count < self.max_fetches_per_context:
                 return
             # Wait for in-flight pages to close before swapping the context. Called
             # with no semaphore slot held, so the wait can actually reach zero.
@@ -133,6 +169,8 @@ class PlaywrightTextFetcher:
             logging.info(f"Recycling Playwright context after {self._fetch_count} fetches")
             await self.close()
             self._fetch_count = 0
+            self._page_close_timeouts = 0
+            self._force_recycle = False
             # _recycle_lock is held here and is not reentrant, so bypass the
             # locking wrapper and launch directly
             await self._launch_browser()
@@ -158,15 +196,31 @@ class PlaywrightTextFetcher:
         # semaphore limits concurrent pages -> backpressure to Scrapy
         if self._semaphore is None:
             # fallback without semaphore if setup partially failed
-            return await self._fetch_with_retries(url)
+            return await self._fetch_with_timeout(url)
         async with self._semaphore:
             self._inflight += 1
             try:
-                result = await self._fetch_with_retries(url)
+                result = await self._fetch_with_timeout(url)
             finally:
                 self._inflight -= 1
             self._fetch_count += 1
             return result
+
+    async def _fetch_with_timeout(self, url: str):
+        if self.fetch_timeout is None:
+            return await self._fetch_with_retries(url)
+        try:
+            return await asyncio.wait_for(
+                self._fetch_with_retries(url),
+                timeout=self.fetch_timeout,
+            )
+        except asyncio.TimeoutError:
+            logging.warning(
+                "Playwright fetch exceeded outer timeout after %.1fs for %s",
+                self.fetch_timeout,
+                url,
+            )
+            return ""
 
     def get_results(self):
         # kept for backwards compat; Playwright fetcher is stateless (not caching by url)
@@ -180,7 +234,11 @@ class PlaywrightTextFetcher:
         try:
             page = await self._context.new_page()
             # Faster than full networkidle; adaptive wait below handles JS
-            await page.goto(url, wait_until="domcontentloaded", timeout=20000)
+            await page.goto(
+                url,
+                wait_until="domcontentloaded",
+                timeout=self.goto_timeout_ms,
+            )
             # Adaptive wait: try networkidle briefly, fallback to short sleep
             try:
                 await page.wait_for_load_state("networkidle", timeout=int(self.wait_time * 1000))
@@ -196,6 +254,9 @@ class PlaywrightTextFetcher:
             text_content = await self._extract_clean_text(page)
             return text_content
 
+        except PlaywrightTimeoutError:
+            logging.warning(f"Playwright navigation timed out for {url}; not retrying")
+            return ""
         except (PlaywrightError, Exception) as e:
             logging.warning(f"Playwright request failed for {url} (try {retries+1}/{self.max_retries+1}): {e}")
             if retries < self.max_retries:
@@ -205,10 +266,7 @@ class PlaywrightTextFetcher:
             return ""
         finally:
             if page is not None:
-                try:
-                    await page.close()
-                except Exception:
-                    pass
+                await self._safe_close_page(page)
 
     async def _extract_clean_text(self, page) -> str:
         noise_selectors = ["nav", "footer", "header", "aside"]
