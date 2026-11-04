@@ -25,7 +25,7 @@ class PlaywrightTextFetcher:
             max_retries=2,
             wait_time=1.5,
             max_concurrent_pages: int = 4,
-            max_fetches_per_context: int = 1000,
+            max_fetches_per_context: int = 5000,
             close_timeout: int = 10,
             page_close_timeout: float = 3.0,
             goto_timeout_ms: int = 10000,
