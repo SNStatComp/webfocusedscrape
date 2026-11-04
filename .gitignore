@@ -232,3 +232,8 @@ output
 # (Debug) Output file types
 *.txt
 *.html
+
+# Local benchmark and test artifacts
+/benchmarks/
+/tests/
+/bench_*/

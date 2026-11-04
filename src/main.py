@@ -1,10 +1,13 @@
+import json
 import logging
 import multiprocessing
 import os
+import random
+import re
 import sys
 import time
+from collections import deque
 
-import numpy as np
 import pandas as pd
 
 from datetime import datetime
@@ -14,6 +17,51 @@ from src.scrape import HesitantSpider
 from src.util import setup, normalize_url, read_parquet_dir, read_input_file
 
 CONFIG = setup("config/config.yaml")
+
+
+def make_batches(urls, batch_size):
+    """Split base URLs into consecutive batches."""
+    size = max(1, int(batch_size))
+    return [urls[i:i + size] for i in range(0, len(urls), size)]
+
+
+def shuffle_urls(urls, seed):
+    """Shuffle input deterministically so batch ordering is reproducible."""
+    shuffled = list(urls)
+    random.Random(int(seed)).shuffle(shuffled)
+    return shuffled
+
+
+def batch_metrics(logfile, batch_id, started_wall):
+    """Read temporary startup/page metrics from the child log."""
+    if logfile.endswith(".log"):
+        worker_log = logfile.replace(".log", f"_worker_{batch_id}.log")
+    else:
+        worker_log = f"{logfile}_worker_{batch_id}.log"
+    startup = None
+    pages = None
+    try:
+        with open(worker_log, encoding="utf-8", errors="replace") as handle:
+            for line in handle:
+                match = re.match(r"(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2})", line)
+                if match and startup is None and "Playwright browser+context pooled" in line:
+                    started = datetime.strptime(match.group(1), "%Y-%m-%d %H:%M:%S")
+                    startup = max(0.0, started.timestamp() - started_wall)
+                match = re.search(r"Crawled (\d+) pages", line)
+                if match:
+                    pages = int(match.group(1))
+    except OSError:
+        pass
+    return startup, pages
+
+
+def classify_batch(elapsed, budget, exitcode, forced=False):
+    """Classify a finished batch without retrying it."""
+    if forced or elapsed >= budget:
+        return "timeout"
+    if exitcode != 0:
+        return "error"
+    return "done"
 
 
 # Spawn spider crawler process
@@ -233,42 +281,144 @@ if __name__ == "__main__":
     # Skip domains
     skip_domains = read_input_file(CONFIG, "skip_domains", "skip_domains")
 
-    # Set amount of parallel workers and prepare chunk-wisem parallel execution
-    max_workers = CONFIG.crawl.max_workers
-    num_workers = min([len(urls), max_workers])
-    logging.info(f"Will use {num_workers} workers!")
-    url_chunks = np.array_split(urls, num_workers)
+    # Persistent parent supervisor: assign consecutive base-URL batches to
+    # short-lived child processes. Each child gets a fresh Scrapy/Playwright
+    # process, so failed/slow batches cannot poison later work.
+    max_workers = int(CONFIG.crawl.get("max_workers", 16))
+    batch_size = int(CONFIG.crawl.get("base_url_batch_size", 2))
+    batch_budget = int(CONFIG.crawl.get("max_duration", 3600))
+    shutdown_grace = int(CONFIG.crawl.get("shutdown_grace", 60))
+    max_run_duration = int(CONFIG.crawl.get("max_run_duration", 0))
+    seed = int(CONFIG.get("seed", 42))
+    urls = shuffle_urls(urls, seed)
+    batches = make_batches(urls, batch_size)
+    num_workers = min(max_workers, len(batches))
 
-    chunked_args = []
+    logging.info(
+        f"Batch dispatcher: {len(batches)} batches of {batch_size}, "
+        f"{num_workers} concurrent workers, budget={batch_budget}s, "
+        f"close_grace={shutdown_grace}s, run_cap={max_run_duration}s"
+    )
+    print(f"# Batches: {len(batches)} (size={batch_size}), workers={num_workers}")
 
-    for i in range(0, num_workers):
-        chunked_args.append(
-            (
-                url_chunks[i],
-                target_netloc_keywords,
-                target_path_keywords,
-                skip_domains,
-                i,
-                logging_level,
-                logfile,
-                # time_part in the name keeps resumed runs from overwriting each other,
-                # since the spider restarts its batch counter at 0 every run
-                f"{dir_results}/{time_part}_worker_{i}.parquet",  # Different output files per worker
-                [CONFIG.crawl.schema.keyword],
-                f"{jobdir_root}/worker_{i}" if jobdir_root else None,
-                20000,
-                jump_netloc_keywords,
-                jump_path_keywords,
-                use_jump_whitelist,
-            )
+    status_path = os.path.join(jobdir_root or dir_results, "batch_status.jsonl")
+    pending = deque(enumerate(batches))
+    active = {}
+
+    def record_batch(batch_id, batch, status, started, started_wall, exitcode):
+        elapsed = time.perf_counter() - started
+        startup_s, pages = batch_metrics(logfile, batch_id, started_wall)
+        record = {
+            "batch_id": batch_id,
+            "base_urls": [{"url": url, "status": status} for url in batch],
+            "status": status,
+            "started_at": datetime.fromtimestamp(started_wall).isoformat(timespec="seconds"),
+            "ended_at": datetime.now().isoformat(timespec="seconds"),
+            "elapsed_s": round(elapsed, 1),
+            "startup_s": None if startup_s is None else round(startup_s, 1),
+            "pages": pages,
+            "exitcode": exitcode,
+        }
+        with open(status_path, "a", encoding="utf-8") as handle:
+            handle.write(json.dumps(record) + "\n")
+        logging.info(
+            f"Batch {batch_id} {status}: {len(batch)} URLs, "
+            f"{elapsed:.1f}s, startup={startup_s}, pages={pages}, exitcode={exitcode}"
         )
-
-    print("# Workers:", num_workers)
+        print(f"Batch {batch_id} {status}: {len(batch)} URLs, {elapsed:.1f}s")
 
     start_time = time.perf_counter()
+    run_deadline = start_time + max_run_duration if max_run_duration > 0 else None
 
-    with multiprocessing.Pool(processes=num_workers) as pool:
-        pool.starmap(spawn_spider_process, chunked_args)
+    try:
+        while pending or active:
+            if run_deadline is not None and time.perf_counter() >= run_deadline:
+                logging.warning("Global benchmark deadline reached; stopping dispatcher")
+                print("Global benchmark deadline reached; stopping dispatcher")
+                for _, _, proc, _, _ in active.values():
+                    if proc.is_alive():
+                        proc.terminate()
+                for pid, (batch_id, batch, proc, started, started_wall) in list(active.items()):
+                    proc.join(timeout=10)
+                    if proc.is_alive():
+                        proc.kill()
+                        proc.join(timeout=5)
+                    record_batch(batch_id, batch, "cutoff", started, started_wall, proc.exitcode)
+                    del active[pid]
+                for batch_id, batch in pending:
+                    record_batch(
+                        batch_id, batch, "unstarted", time.perf_counter(), time.time(), None
+                    )
+                pending.clear()
+                break
+
+            while pending and len(active) < num_workers:
+                if run_deadline is not None and time.perf_counter() >= run_deadline:
+                    break
+                batch_id, batch = pending.popleft()
+                output_file = f"{dir_results}/{time_part}_batch_{batch_id}.parquet"
+                batch_jobdir = (
+                    f"{jobdir_root}/batch_{batch_id}" if jobdir_root else None
+                )
+                proc = multiprocessing.Process(
+                    target=spawn_spider_process,
+                    args=(
+                        batch,
+                        target_netloc_keywords,
+                        target_path_keywords,
+                        skip_domains,
+                        batch_id,
+                        logging_level,
+                        logfile,
+                        output_file,
+                        [CONFIG.crawl.schema.keyword],
+                        batch_jobdir,
+                        20000,
+                        jump_netloc_keywords,
+                        jump_path_keywords,
+                        use_jump_whitelist,
+                    ),
+                )
+                proc.start()
+                active[proc.pid] = (batch_id, batch, proc, time.perf_counter(), time.time())
+                logging.info(f"Batch {batch_id} started with {len(batch)} URLs")
+
+            for pid, (batch_id, batch, proc, started, started_wall) in list(active.items()):
+                elapsed = time.perf_counter() - started
+                forced = False
+                if proc.is_alive():
+                    if elapsed < batch_budget + shutdown_grace:
+                        continue
+                    logging.warning(
+                        f"Batch {batch_id} exceeded {batch_budget}s + "
+                        f"{shutdown_grace}s; terminating"
+                    )
+                    proc.terminate()
+                    proc.join(timeout=10)
+                    if proc.is_alive():
+                        proc.kill()
+                        proc.join(timeout=10)
+                    forced = True
+                else:
+                    proc.join()
+
+                status = classify_batch(
+                    elapsed, batch_budget, proc.exitcode, forced
+                )
+                record_batch(batch_id, batch, status, started, started_wall, proc.exitcode)
+                del active[pid]
+
+            if active:
+                time.sleep(1)
+    except KeyboardInterrupt:
+        for _, _, proc, _, _ in active.values():
+            if proc.is_alive():
+                proc.terminate()
+                proc.join(timeout=10)
+                if proc.is_alive():
+                    proc.kill()
+                    proc.join(timeout=10)
+        raise
 
     end_time = time.perf_counter()
 

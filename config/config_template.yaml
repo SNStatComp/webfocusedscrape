@@ -9,6 +9,7 @@ aws:
 requests:
   timeout_read: 10
   max_retries: 2
+seed: 42
 input:
   input_dir: input
   input_files:
@@ -28,7 +29,10 @@ output:
   aggregate: output_scrape.parquet # Cumulative summary table, excluded from the batch read
 crawl:
   max_workers: 16
-  max_duration: 500
+  max_duration: 7200
+  base_url_batch_size: 2
+  shutdown_grace: 60
+  max_run_duration: 0  # 0 = run until the batch queue is exhausted
   max_depth: 2
   max_jumps: 1
   max_sitemap_depth: 1
