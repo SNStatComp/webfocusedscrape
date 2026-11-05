@@ -6,7 +6,6 @@ import random
 import re
 import sys
 import time
-from collections import deque
 
 import pandas as pd
 
@@ -14,6 +13,7 @@ from datetime import datetime
 from scrapy.crawler import CrawlerProcess
 
 from src.scrape import HesitantSpider
+from src.scrape.BatchQueue import BatchQueue
 from src.util import setup, normalize_url, read_parquet_dir, read_input_file
 
 CONFIG = setup("config/config.yaml")
@@ -293,7 +293,9 @@ if __name__ == "__main__":
     seed = int(CONFIG.get("seed", 42))
     urls = shuffle_urls(urls, seed)
     batches = make_batches(urls, batch_size)
-    num_workers = min(max_workers, len(batches))
+    queue_state_path = os.path.join(jobdir_root or dir_results, "batch_queue_state.json")
+    batch_queue = BatchQueue(queue_state_path, batches)
+    num_workers = min(max_workers, batch_queue.pending_count())
 
     logging.info(
         f"Batch dispatcher: {len(batches)} batches of {batch_size}, "
@@ -304,14 +306,14 @@ if __name__ == "__main__":
 
     status_path = os.path.join(jobdir_root or dir_results, "batch_status.jsonl")
     visited_db_path = os.path.join(dir_results, "visited.sqlite")
-    pending = deque(enumerate(batches))
     active = {}
 
-    def record_batch(batch_id, batch, status, started, started_wall, exitcode):
+    def record_batch(batch_id, batch, status, started, started_wall, exitcode, attempt, log_id):
         elapsed = time.perf_counter() - started
-        startup_s, pages = batch_metrics(logfile, batch_id, started_wall)
+        startup_s, pages = batch_metrics(logfile, log_id, started_wall)
         record = {
             "batch_id": batch_id,
+            "attempt": attempt,
             "base_urls": [{"url": url, "status": status} for url in batch],
             "status": status,
             "started_at": datetime.fromtimestamp(started_wall).isoformat(timespec="seconds"),
@@ -333,32 +335,45 @@ if __name__ == "__main__":
     run_deadline = start_time + max_run_duration if max_run_duration > 0 else None
 
     try:
-        while pending or active:
+        while batch_queue.has_work() or active:
             if run_deadline is not None and time.perf_counter() >= run_deadline:
                 logging.warning("Global benchmark deadline reached; stopping dispatcher")
                 print("Global benchmark deadline reached; stopping dispatcher")
-                for _, _, proc, _, _ in active.values():
+                for _, _, proc, _, _, _, _ in active.values():
                     if proc.is_alive():
                         proc.terminate()
-                for pid, (batch_id, batch, proc, started, started_wall) in list(active.items()):
+                for pid, (
+                    batch_id,
+                    batch,
+                    proc,
+                    started,
+                    started_wall,
+                    attempt,
+                    log_id,
+                ) in list(active.items()):
                     proc.join(timeout=10)
                     if proc.is_alive():
                         proc.kill()
                         proc.join(timeout=5)
-                    record_batch(batch_id, batch, "cutoff", started, started_wall, proc.exitcode)
-                    del active[pid]
-                for batch_id, batch in pending:
                     record_batch(
-                        batch_id, batch, "unstarted", time.perf_counter(), time.time(), None
+                        batch_id, batch, "cutoff", started, started_wall,
+                        proc.exitcode, attempt, log_id,
                     )
-                pending.clear()
+                    batch_queue.finish(batch_id, "cutoff")
+                    del active[pid]
                 break
 
-            while pending and len(active) < num_workers:
+            while batch_queue.has_work() and len(active) < num_workers:
                 if run_deadline is not None and time.perf_counter() >= run_deadline:
                     break
-                batch_id, batch = pending.popleft()
-                output_file = f"{dir_results}/{time_part}_batch_{batch_id}.parquet"
+                item = batch_queue.pop()
+                if item is None:
+                    break
+                batch_id, batch, attempt = item
+                log_id = f"{batch_id}_a{attempt}"
+                output_file = (
+                    f"{dir_results}/{time_part}_batch_{batch_id}_attempt_{attempt}.parquet"
+                )
                 batch_jobdir = (
                     f"{jobdir_root}/batch_{batch_id}" if jobdir_root else None
                 )
@@ -369,7 +384,7 @@ if __name__ == "__main__":
                         target_netloc_keywords,
                         target_path_keywords,
                         skip_domains,
-                        batch_id,
+                        log_id,
                         logging_level,
                         logfile,
                         output_file,
@@ -383,18 +398,29 @@ if __name__ == "__main__":
                     ),
                 )
                 proc.start()
-                active[proc.pid] = (batch_id, batch, proc, time.perf_counter(), time.time())
-                logging.info(f"Batch {batch_id} started with {len(batch)} URLs")
+                active[proc.pid] = (
+                    batch_id, batch, proc, time.perf_counter(), time.time(),
+                    attempt, log_id,
+                )
+                logging.info(f"Batch {batch_id} attempt {attempt} started with {len(batch)} URLs")
 
-            for pid, (batch_id, batch, proc, started, started_wall) in list(active.items()):
+            for pid, (
+                batch_id,
+                batch,
+                proc,
+                started,
+                started_wall,
+                attempt,
+                log_id,
+            ) in list(active.items()):
                 elapsed = time.perf_counter() - started
                 forced = False
                 if proc.is_alive():
                     if elapsed < batch_budget + shutdown_grace:
                         continue
                     logging.warning(
-                        f"Batch {batch_id} exceeded {batch_budget}s + "
-                        f"{shutdown_grace}s; terminating"
+                        f"Batch {batch_id} attempt {attempt} exceeded "
+                        f"{batch_budget}s + {shutdown_grace}s; terminating"
                     )
                     proc.terminate()
                     proc.join(timeout=10)
@@ -408,13 +434,17 @@ if __name__ == "__main__":
                 status = classify_batch(
                     elapsed, batch_budget, proc.exitcode, forced
                 )
-                record_batch(batch_id, batch, status, started, started_wall, proc.exitcode)
+                record_batch(
+                    batch_id, batch, status, started, started_wall,
+                    proc.exitcode, attempt, log_id,
+                )
+                batch_queue.finish(batch_id, status)
                 del active[pid]
 
             if active:
                 time.sleep(1)
     except KeyboardInterrupt:
-        for _, _, proc, _, _ in active.values():
+        for _, _, proc, _, _, _, _ in active.values():
             if proc.is_alive():
                 proc.terminate()
                 proc.join(timeout=10)
