@@ -65,7 +65,7 @@ def classify_batch(elapsed, budget, exitcode, forced=False):
 
 
 # Spawn spider crawler process
-def spawn_spider_process(urls, netloc_keywords, path_keywords, skip_domains, process_id, log_level, logfile, output_file, schema_keywords, jobdir=None, sitemap_max_urls=20000, jump_netloc_keywords=None, jump_path_keywords=None, use_jump_whitelist=True):
+def spawn_spider_process(urls, netloc_keywords, path_keywords, skip_domains, process_id, log_level, logfile, output_file, schema_keywords, jobdir=None, visited_db_path=None, sitemap_max_urls=20000, jump_netloc_keywords=None, jump_path_keywords=None, use_jump_whitelist=True):
     # Urls may be numpy array from np.array_split -> convert to list
     if not isinstance(urls, list):
         try:
@@ -207,6 +207,7 @@ def spawn_spider_process(urls, netloc_keywords, path_keywords, skip_domains, pro
         max_sitemap_depth=crawl_max_sitemap_depth,
         sitemap_page_budget=crawl_sitemap_page_budget,
         jobdir=jobdir,
+        visited_db_path=visited_db_path,
     )
 
     # If worker gets 0 urls, pass (shouldn't happen)
@@ -220,7 +221,7 @@ def spawn_spider_process(urls, netloc_keywords, path_keywords, skip_domains, pro
         print(f"Something went from starting process! Error {e}")
 
     if spiderCrawler.spider is not None:
-        print(f"Returning results of length for PID {process_id} ({len(urls)} URLs: {urls}): {spiderCrawler.spider.total_saved} ({len(spiderCrawler.spider.visited)} visited)")
+        print(f"Returning results of length for PID {process_id} ({len(urls)} URLs: {urls}): {spiderCrawler.spider.total_saved}")
     return spiderCrawler.spider.total_saved
 
 
@@ -302,6 +303,7 @@ if __name__ == "__main__":
     print(f"# Batches: {len(batches)} (size={batch_size}), workers={num_workers}")
 
     status_path = os.path.join(jobdir_root or dir_results, "batch_status.jsonl")
+    visited_db_path = os.path.join(dir_results, "visited.sqlite")
     pending = deque(enumerate(batches))
     active = {}
 
@@ -373,6 +375,7 @@ if __name__ == "__main__":
                         output_file,
                         [CONFIG.crawl.schema.keyword],
                         batch_jobdir,
+                        visited_db_path,
                         20000,
                         jump_netloc_keywords,
                         jump_path_keywords,

@@ -12,6 +12,7 @@ import tldextract
 from scrapy.exceptions import CloseSpider
 
 from src.fetch import PlaywrightTextFetcher
+from src.scrape.SharedVisited import SharedVisited
 from src.parse import SchemaParser
 from src.scrape.ScrapyResult import ScrapyResult
 from src.util import normalize_url
@@ -89,6 +90,7 @@ class HesitantSpider(scrapy.Spider):
         sitemap_page_budget: int = 5000,  # cap on cumulative sitemap-discovered page urls per base domain
         sitemap_batch_size: int = 1000,  # internal batch for logging only
         jobdir: str | None = None,  # Scrapy JOBDIR for resume
+        visited_db_path: str | None = None,  # Shared SQLite visited store
         playwright_max_concurrent: int | None = None,  # None = default below
         *args, **kwargs
     ):
@@ -145,6 +147,7 @@ class HesitantSpider(scrapy.Spider):
         self.logger.info(f"Init sitemap_page_budget: {self.sitemap_page_budget}")
         self.sitemap_batch_size = sitemap_batch_size
         self.jobdir = jobdir
+        self._visited_store = SharedVisited(visited_db_path or ":memory:")
 
         # Pre-compile regexes and build sets for hot paths
         # Use IGNORECASE to catch OJA variants like /Vacatures/
@@ -177,7 +180,6 @@ class HesitantSpider(scrapy.Spider):
         # No in-memory result retention: rows persist in parquet batches, so the spider never keeps unbounded content in RAM over a long (re)run
         self.batch = []
         self.total_saved = 0
-        self.visited = set()
         # For logging the (relevant) domains linked from each base-url
         self.starturl_linkeddomains = {start_url: set() for start_url in start_urls}
         # per-base-domain accounting for the sitemap page-url budget
@@ -187,23 +189,6 @@ class HesitantSpider(scrapy.Spider):
         self._job_sitemaps_probed = set()
         # executor for offloading parquet writes (avoid blocking reactor)
         self._save_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="parquet-save")
-        # buffer for visited persistence to avoid per-parse open/close
-        self._visited_buffer = []
-
-        # If jobdir was passed, load visited and continue run
-        if self.jobdir:
-            try:
-                import os
-                visited_file = os.path.join(self.jobdir, "visited.txt")
-                if os.path.exists(visited_file):
-                    with open(visited_file, "r", encoding="utf-8") as f:
-                        for line in f:
-                            u = line.strip()
-                            if u:
-                                self.visited.add(u)
-                    self.logger.info(f"Resumed {len(self.visited)} visited from {visited_file}")
-            except Exception as e:
-                self.logger.debug(f"JOBDIR load failed: {e}")
 
         if max_depth < 0:
             self.logger.debug("Only urls from starting_url can be found, max_depth < 0")
@@ -250,22 +235,32 @@ class HesitantSpider(scrapy.Spider):
         self.start_time = time.time()
         for start_url in self.start_urls:
             initial_meta = self._scope(start_url)
-            yield scrapy.Request(
-                url=start_url,
-                callback=self.parse,
-                errback=self.handle_error,
-                meta=initial_meta,
-                dont_filter=True,
+            sitemap_urls = [
+                urljoin(initial_meta["base_url"], sitemap_path)
+                for sitemap_path in self.sitemaps_tocheck
+            ]
+            claimed = set(
+                self._visited_store.claim_many(
+                    initial_meta["base_url"], [start_url, *sitemap_urls]
+                )
             )
-            for sitemap_path in self.sitemaps_tocheck:
-                sitemap_url = urljoin(initial_meta["base_url"], sitemap_path)
+            if start_url in claimed:
                 yield scrapy.Request(
-                    url=sitemap_url,
-                    callback=self.parse_sitemap,
+                    url=start_url,
+                    callback=self.parse,
                     errback=self.handle_error,
-                    meta={**initial_meta, "sitemap": True, "sitemap_depth": 0},
+                    meta=initial_meta,
                     dont_filter=True,
                 )
+            for sitemap_url in sitemap_urls:
+                if sitemap_url in claimed:
+                    yield scrapy.Request(
+                        url=sitemap_url,
+                        callback=self.parse_sitemap,
+                        errback=self.handle_error,
+                        meta={**initial_meta, "sitemap": True, "sitemap_depth": 0},
+                        dont_filter=True,
+                    )
 
     # Save current batch to disk - sync but batched larger (500) to amortize cost
     # Small overhead is fine; offload if you want non-blocking
@@ -327,14 +322,6 @@ class HesitantSpider(scrapy.Spider):
                 return True, pat.pattern
 
         return False, None
-
-    # Function to check if we've visited the url, seperated from skip_this_url for domain-logging
-    def already_visited(self, url: str) -> bool:
-        # Fast visited check (exact + canonical fragment/trailing slash stripped)
-        if url in self.visited:
-            return True
-        canon = url.split("#")[0].rstrip("/")
-        return canon != url and canon in self.visited
 
     # Determine whether or not to skip URL - optimized for hot path
     def skip_this_url(self, url: str) -> bool:
@@ -501,27 +488,8 @@ class HesitantSpider(scrapy.Spider):
             f"depth: {current_depth}, steps from target: {steps_from_target}, "
             f"jumps: {scope['jumps']}"
         )
-        self.visited.add(response.url)
-        _canon = response.url.split("#")[0].rstrip("/")
-        if _canon != response.url:
-            self.visited.add(_canon)
-        if self.jobdir:
-            self._visited_buffer.append(response.url)
-            if _canon != response.url:
-                self._visited_buffer.append(_canon)
-            if len(self._visited_buffer) >= 100:
-                try:
-                    import os
-                    os.makedirs(self.jobdir, exist_ok=True)
-                    buf = self._visited_buffer
-                    self._visited_buffer = []
-                    def _flush_visited(b=buf, jd=self.jobdir):
-                        with open(os.path.join(jd, "visited.txt"), "a", encoding="utf-8") as f:
-                            f.write("\n".join(b) + "\n")
-                    self._save_executor.submit(_flush_visited)
-                except Exception:
-                    pass
-
+        base_url = scope["base_url"]
+        candidate_links = {}
         for link in response.css("a::attr(href)").getall():
             url = urljoin(response.url, link)
             
@@ -531,7 +499,6 @@ class HesitantSpider(scrapy.Spider):
 
             # Log the linked domain before any filtering, so that skipped and
             # already-seen links are still attributed to the base url.
-            base_url = scope["base_url"]
             url_domain = urlparse(url).hostname
             if url_domain:
                 url_domain = url_domain.lower()
@@ -541,10 +508,6 @@ class HesitantSpider(scrapy.Spider):
                         f"New entry (base url, linked domain): ({base_url}, {url_domain}), "
                         f"counter: {len(self.starturl_linkeddomains[base_url])}"
                     )
-
-            # if vistied, we now have logged the domain, but can still skip (repeated) visit
-            if self.already_visited(url):
-                continue
 
             child_scope = self._scope(url, scope)
             if child_scope is None:
@@ -560,13 +523,21 @@ class HesitantSpider(scrapy.Spider):
                 continue
             child_scope["depth"] = current_depth + 1
             child_scope["steps_from_target"] = 0 if url_is_targeted else steps_from_target + 1
-            yield scrapy.Request(
-                url=url,
-                callback=self.parse,
-                errback=self.handle_error,
-                meta=child_scope,
-                dont_filter=False,
+            candidate_links.setdefault(url, child_scope)
+
+        if candidate_links:
+            claimed = set(
+                self._visited_store.claim_many(base_url, candidate_links.keys())
             )
+            for url, child_scope in candidate_links.items():
+                if url in claimed:
+                    yield scrapy.Request(
+                        url=url,
+                        callback=self.parse,
+                        errback=self.handle_error,
+                        meta=child_scope,
+                        dont_filter=False,
+                    )
 
         if url_is_targeted:
             self.logger.debug(f"Found targeted url: {response.url} from base url {scope['base_url']}")
@@ -681,6 +652,8 @@ class HesitantSpider(scrapy.Spider):
                     )
                     continue
                 nested_scope = {**self.sitemap_scope_meta(scope, sitemap_domain, response), "sitemap_depth": sitemap_depth + 1}
+                if not self._visited_store.claim_many(scope["base_url"], [url]):
+                    continue
                 yield scrapy.Request(
                     url=url,
                     callback=self.parse_sitemap,
@@ -705,6 +678,8 @@ class HesitantSpider(scrapy.Spider):
                     continue
                 budget_exhausted = pages_used >= self.sitemap_page_budget
 
+            if not self._visited_store.claim_many(scope["base_url"], [url]):
+                continue
             yield scrapy.Request(
                 url=url,
                 callback=self.parse,
@@ -723,23 +698,16 @@ class HesitantSpider(scrapy.Spider):
     # Called when the spider closes cleanly
     async def closed(self, reason):
         self.save_batch()
-        # Flush visited/sitemap buffers if JOBDIR
-        if self.jobdir:
-            try:
-                import os
-                os.makedirs(self.jobdir, exist_ok=True)
-                if self._visited_buffer:
-                    with open(os.path.join(self.jobdir, "visited.txt"), "a", encoding="utf-8") as f:
-                        f.write("\n".join(self._visited_buffer) + "\n")
-                    self._visited_buffer = []
-            except Exception:
-                pass
         try:
             await self._fetcher.close()
         except Exception as e:
             self.logger.debug(f"Error closing fetcher: {e}")
         try:
             self._save_executor.shutdown(wait=True)
+        except Exception:
+            pass
+        try:
+            self._visited_store.close()
         except Exception:
             pass
         self.logger.info(f"Spider closed because of: {reason}. Total saved pages: {self.total_saved}")
