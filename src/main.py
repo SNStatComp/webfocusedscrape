@@ -1,3 +1,4 @@
+import asyncio
 import json
 import logging
 import multiprocessing
@@ -5,6 +6,7 @@ import os
 import random
 import re
 import sys
+import threading
 import time
 
 import pandas as pd
@@ -115,8 +117,49 @@ def build_aggregate(dir_results, aggregate_name, include_existing=True, aggregat
     return dedupe_results(merged), raw_rows, used_files
 
 
+def stop_crawler_when_parent_dies(crawler, parent_read):
+    """Ask Scrapy to stop gracefully when the parent process exits.
+
+    The parent keeps the write end of a shared pipe open for its lifetime and
+    passes the read end to every child. A watcher thread blocks until the pipe
+    reports EOF (the parent's write end closed, on any OS and any death signal),
+    then schedules a graceful stop in the reactor thread. That runs the normal
+    shutdown path: drain in-flight requests, flush the output buffer, close the
+    batch JOBDIR and Playwright.
+    """
+    if parent_read is None:
+        return
+
+    def watch():
+        try:
+            from multiprocessing.connection import wait
+
+            wait([parent_read])
+        except Exception:
+            pass
+        logging.info("Parent process exited; stopping crawler")
+        try:
+            from twisted.internet import reactor
+
+            def request_stop():
+                try:
+                    asyncio.ensure_future(crawler.stop_async())
+                except Exception:
+                    os._exit(1)
+
+            reactor.callFromThread(request_stop)
+        except Exception:
+            os._exit(1)
+
+    threading.Thread(target=watch, name="parent-watch", daemon=True).start()
+
+
 # Spawn spider crawler process
-def spawn_spider_process(urls, netloc_keywords, path_keywords, skip_domains, process_id, log_level, logfile, output_file, schema_keywords, jobdir=None, visited_db_path=None, sitemap_max_urls=20000, jump_netloc_keywords=None, jump_path_keywords=None, use_jump_whitelist=True, attempt=1, frontier_pending_count=0):
+def spawn_spider_process(urls, netloc_keywords, path_keywords, skip_domains, process_id, log_level, logfile, output_file, schema_keywords, jobdir=None, visited_db_path=None, sitemap_max_urls=20000, jump_netloc_keywords=None, jump_path_keywords=None, use_jump_whitelist=True, attempt=1, frontier_pending_count=0, parent_read=None, parent_write=None):
+    # Under fork the write end of the parent-life pipe is inherited by every
+    # child; close our copy so EOF is reached while the parent is still alive.
+    if parent_write is not None:
+        parent_write.close()
     # Urls may be numpy array from np.array_split -> convert to list
     if not isinstance(urls, list):
         try:
@@ -267,6 +310,8 @@ def spawn_spider_process(urls, netloc_keywords, path_keywords, skip_domains, pro
     if len(urls) == 0:
         return []
 
+    stop_crawler_when_parent_dies(spiderCrawler, parent_read)
+
     try:
         print(f"Starting crawling process (PID: {process_id}, OSPID: {os.getpid()}) for {urls}!")
         process.start()
@@ -390,6 +435,13 @@ if __name__ == "__main__":
     start_time = time.perf_counter()
     run_deadline = start_time + max_run_duration if max_run_duration > 0 else None
 
+    # Parent-life pipe: the parent keeps `parent_write` open; every child gets
+    # `parent_read`. On parent death the write end closes, EOF fires in all
+    # children. Under fork each child must close the inherited write end itself
+    # (done in spawn_spider_process); spawn does not pass it.
+    parent_read, parent_write = multiprocessing.Pipe(duplex=False)
+    use_fork = multiprocessing.get_start_method() == "fork"
+
     try:
         while batch_queue.has_work() or active:
             if run_deadline is not None and time.perf_counter() >= run_deadline:
@@ -454,6 +506,8 @@ if __name__ == "__main__":
                         use_jump_whitelist,
                         attempt,
                         pending_frontier,
+                        parent_read,
+                        parent_write if use_fork else None,
                     ),
                 )
                 proc.start()
