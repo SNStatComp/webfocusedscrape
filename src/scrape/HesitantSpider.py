@@ -29,6 +29,23 @@ _CCTLD = frozenset(t for t in _TLD_EXTRACT.tlds if len(t) == 2 and t.isalpha())
 _SEARCH_QUERY_KEYS = frozenset({"q", "s", "search", "searchterm", "query", "zoek", "zoeken", "zoekterm"})
 
 
+def resume_mode(attempt, frontier_pending):
+    """Decide how a batch attempt seeds its crawl.
+
+    normal        first attempt: seed only URLs not already claimed.
+    resume_queue  retry with pending requests in the batch JOBDIR: let Scrapy
+                  replay the persisted frontier, do not re-seed.
+    restart_seeds retry with an empty frontier: re-seed even if claimed, so a
+                  batch interrupted while its first requests were in flight can
+                  make progress instead of closing instantly.
+    """
+    if int(attempt) > 1 and int(frontier_pending) > 0:
+        return "resume_queue"
+    if int(attempt) > 1:
+        return "restart_seeds"
+    return "normal"
+
+
 def _brand_label(entry: str) -> str:
     """Registrable-domain label for a skip entry, so one entry covers a brand
     across TLDs (linkedin.com also blocks linkedin.nl / linkedin.be)."""
@@ -91,6 +108,8 @@ class HesitantSpider(scrapy.Spider):
         sitemap_batch_size: int = 1000,  # internal batch for logging only
         jobdir: str | None = None,  # Scrapy JOBDIR for resume
         visited_db_path: str | None = None,  # Shared SQLite visited store
+        attempt: int = 1,  # Batch attempt number (1 = first dispatch)
+        frontier_pending: int = 0,  # Requests persisted in this batch's JOBDIR
         playwright_max_concurrent: int | None = None,  # None = default below
         *args, **kwargs
     ):
@@ -147,6 +166,8 @@ class HesitantSpider(scrapy.Spider):
         self.logger.info(f"Init sitemap_page_budget: {self.sitemap_page_budget}")
         self.sitemap_batch_size = sitemap_batch_size
         self.jobdir = jobdir
+        self.attempt = int(attempt)
+        self.frontier_pending = int(frontier_pending)
         self._visited_store = SharedVisited(visited_db_path or ":memory:")
 
         # Pre-compile regexes and build sets for hot paths
@@ -233,6 +254,19 @@ class HesitantSpider(scrapy.Spider):
     # Asynchronous function that starts the crawl
     async def start(self):
         self.start_time = time.time()
+        mode = resume_mode(self.attempt, self.frontier_pending)
+        if mode == "resume_queue":
+            self.logger.info(
+                f"Batch attempt {self.attempt}: resuming {self.frontier_pending} "
+                "requests from the persisted JOBDIR queue"
+            )
+            return
+        restart_seeds = mode == "restart_seeds"
+        if restart_seeds:
+            self.logger.info(
+                f"Batch attempt {self.attempt}: empty frontier, re-seeding "
+                f"{len(self.start_urls)} URLs"
+            )
         for start_url in self.start_urls:
             initial_meta = self._scope(start_url)
             sitemap_urls = [
@@ -244,7 +278,7 @@ class HesitantSpider(scrapy.Spider):
                     initial_meta["base_url"], [start_url, *sitemap_urls]
                 )
             )
-            if start_url in claimed:
+            if restart_seeds or start_url in claimed:
                 yield scrapy.Request(
                     url=start_url,
                     callback=self.parse,
@@ -253,7 +287,7 @@ class HesitantSpider(scrapy.Spider):
                     dont_filter=True,
                 )
             for sitemap_url in sitemap_urls:
-                if sitemap_url in claimed:
+                if restart_seeds or sitemap_url in claimed:
                     yield scrapy.Request(
                         url=sitemap_url,
                         callback=self.parse_sitemap,
@@ -267,7 +301,7 @@ class HesitantSpider(scrapy.Spider):
     def save_batch(self):
         if len(self.batch) == 0:
             self.logger.debug("Tried to save batch without any results..")
-            return
+            return 0
 
         df = pd.DataFrame({
             "base_url": [res.base_url for res in self.batch],
@@ -294,10 +328,12 @@ class HesitantSpider(scrapy.Spider):
                 self.logger.error(f"Fallback save also failed: {e2}")
 
         self.batch_counter += 1
-        self.total_saved += len(self.batch)
+        saved_rows = len(self.batch)
+        self.total_saved += saved_rows
 
         # Empty batch
         self.batch = []
+        return saved_rows
         self.logger.info(f"Saved batch to parquet, total saved: {self.total_saved}")
 
     # Determine whether or not URL matches a set of pre-compiled netloc/path keyword regexes
@@ -697,7 +733,12 @@ class HesitantSpider(scrapy.Spider):
 
     # Called when the spider closes cleanly
     async def closed(self, reason):
-        self.save_batch()
+        buffered_rows = len(self.batch)
+        flushed_rows = self.save_batch()
+        self.logger.info(
+            f"Shutdown flush: {flushed_rows} rows saved before teardown "
+            f"(buffered={buffered_rows}, reason={reason})"
+        )
         try:
             await self._fetcher.close()
         except Exception as e:

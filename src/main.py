@@ -64,8 +64,25 @@ def classify_batch(elapsed, budget, exitcode, forced=False):
     return "done"
 
 
+def frontier_pending(jobdir):
+    """Count requests persisted in a batch JOBDIR queue (0 when absent/unreadable)."""
+    if not jobdir:
+        return 0
+    queue_root = os.path.join(jobdir, "requests.queue")
+    total = 0
+    for root, _dirs, files in os.walk(queue_root):
+        if "info.json" not in files:
+            continue
+        try:
+            with open(os.path.join(root, "info.json"), encoding="utf-8") as handle:
+                total += int(json.load(handle).get("size") or 0)
+        except (OSError, ValueError, TypeError):
+            continue
+    return total
+
+
 # Spawn spider crawler process
-def spawn_spider_process(urls, netloc_keywords, path_keywords, skip_domains, process_id, log_level, logfile, output_file, schema_keywords, jobdir=None, visited_db_path=None, sitemap_max_urls=20000, jump_netloc_keywords=None, jump_path_keywords=None, use_jump_whitelist=True):
+def spawn_spider_process(urls, netloc_keywords, path_keywords, skip_domains, process_id, log_level, logfile, output_file, schema_keywords, jobdir=None, visited_db_path=None, sitemap_max_urls=20000, jump_netloc_keywords=None, jump_path_keywords=None, use_jump_whitelist=True, attempt=1, frontier_pending_count=0):
     # Urls may be numpy array from np.array_split -> convert to list
     if not isinstance(urls, list):
         try:
@@ -208,6 +225,8 @@ def spawn_spider_process(urls, netloc_keywords, path_keywords, skip_domains, pro
         sitemap_page_budget=crawl_sitemap_page_budget,
         jobdir=jobdir,
         visited_db_path=visited_db_path,
+        attempt=attempt,
+        frontier_pending=frontier_pending_count,
     )
 
     # If worker gets 0 urls, pass (shouldn't happen)
@@ -322,6 +341,9 @@ if __name__ == "__main__":
             "startup_s": None if startup_s is None else round(startup_s, 1),
             "pages": pages,
             "exitcode": exitcode,
+            "frontier_pending": frontier_pending(
+                f"{jobdir_root}/batch_{batch_id}" if jobdir_root else None
+            ),
         }
         with open(status_path, "a", encoding="utf-8") as handle:
             handle.write(json.dumps(record) + "\n")
@@ -351,7 +373,7 @@ if __name__ == "__main__":
                     attempt,
                     log_id,
                 ) in list(active.items()):
-                    proc.join(timeout=10)
+                    proc.join(timeout=120)
                     if proc.is_alive():
                         proc.kill()
                         proc.join(timeout=5)
@@ -377,6 +399,7 @@ if __name__ == "__main__":
                 batch_jobdir = (
                     f"{jobdir_root}/batch_{batch_id}" if jobdir_root else None
                 )
+                pending_frontier = frontier_pending(batch_jobdir)
                 proc = multiprocessing.Process(
                     target=spawn_spider_process,
                     args=(
@@ -395,6 +418,8 @@ if __name__ == "__main__":
                         jump_netloc_keywords,
                         jump_path_keywords,
                         use_jump_whitelist,
+                        attempt,
+                        pending_frontier,
                     ),
                 )
                 proc.start()
@@ -402,7 +427,10 @@ if __name__ == "__main__":
                     batch_id, batch, proc, time.perf_counter(), time.time(),
                     attempt, log_id,
                 )
-                logging.info(f"Batch {batch_id} attempt {attempt} started with {len(batch)} URLs")
+                logging.info(
+                    f"Batch {batch_id} attempt {attempt} started with {len(batch)} URLs "
+                    f"(frontier_pending={pending_frontier})"
+                )
 
             for pid, (
                 batch_id,
@@ -423,7 +451,7 @@ if __name__ == "__main__":
                         f"{batch_budget}s + {shutdown_grace}s; terminating"
                     )
                     proc.terminate()
-                    proc.join(timeout=10)
+                    proc.join(timeout=120)
                     if proc.is_alive():
                         proc.kill()
                         proc.join(timeout=10)
@@ -447,7 +475,7 @@ if __name__ == "__main__":
         for _, _, proc, _, _, _, _ in active.values():
             if proc.is_alive():
                 proc.terminate()
-                proc.join(timeout=10)
+                proc.join(timeout=120)
                 if proc.is_alive():
                     proc.kill()
                     proc.join(timeout=10)
