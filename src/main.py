@@ -81,6 +81,40 @@ def frontier_pending(jobdir):
     return total
 
 
+def dedupe_results(frame):
+    """Keep one row per (base_url, url), preferring the most recent timestamp."""
+    if frame is None or len(frame) == 0:
+        return frame
+    if "timestamp" in frame.columns:
+        frame = frame.sort_values("timestamp", kind="stable")
+    return frame.drop_duplicates(subset=["base_url", "url"], keep="last").reset_index(drop=True)
+
+
+def build_aggregate(dir_results, aggregate_name, include_existing=True, aggregate_path=None):
+    """Merge the existing aggregate with new batch parquet files.
+
+    Returns ``(deduped_frame_or_None, raw_row_count, used_files)``. ``used_files``
+    lists only batch files that read successfully, so callers can delete exactly
+    what was merged and keep the crawl series cumulative.
+    """
+    frames = []
+    base_path = aggregate_path or os.path.join(dir_results, aggregate_name)
+    if include_existing and os.path.exists(base_path):
+        try:
+            frames.append(pd.read_parquet(base_path))
+        except Exception as exc:
+            logging.warning(f"Could not read existing aggregate {base_path}: {exc}")
+    used_files = []
+    frames.extend(
+        read_parquet_dir(dir_results, exclude=(aggregate_name,), collected=used_files)
+    )
+    if not frames:
+        return None, 0, used_files
+    merged = pd.concat(frames, ignore_index=True)
+    raw_rows = len(merged)
+    return dedupe_results(merged), raw_rows, used_files
+
+
 # Spawn spider crawler process
 def spawn_spider_process(urls, netloc_keywords, path_keywords, skip_domains, process_id, log_level, logfile, output_file, schema_keywords, jobdir=None, visited_db_path=None, sitemap_max_urls=20000, jump_netloc_keywords=None, jump_path_keywords=None, use_jump_whitelist=True, attempt=1, frontier_pending_count=0):
     # Urls may be numpy array from np.array_split -> convert to list
@@ -483,28 +517,43 @@ if __name__ == "__main__":
 
     end_time = time.perf_counter()
 
-    # Results in tables. With a jobdir this reads every batch the crawl series has
-    # produced, so the aggregate covers prior runs too; without one it is this run only.
-    # The cumulative aggregate lives in this same dir, so it is excluded from the read,
-    # or its own rows would be counted again on the next run.
-    parquet_dfs = read_parquet_dir(dir_results, exclude=(aggregate_name,))
+    # Results in tables. With a jobdir the aggregate is cumulative: the existing
+    # aggregate plus every new batch parquet since the last run. Without a jobdir it
+    # is this run only. Batch parquet files are deleted after a successful merge so
+    # the jobdir does not accumulate thousands of small files.
+    if jobdir_root:
+        file_aggregate = f"{dir_results}/{aggregate_name}"
+    else:
+        # No jobdir: one aggregate per run, so the timestamp is part of the name
+        stem = os.path.splitext(aggregate_name)[0] or aggregate_name
+        file_aggregate = f"{CONFIG.output.output_dir}/{stem}_{time_part}.parquet"
 
-    # Analysis
-    dfs = []
-    for df in parquet_dfs:
-        dfs.append(df)
+    results, raw_rows, used_files = build_aggregate(
+        dir_results, aggregate_name, include_existing=bool(jobdir_root),
+        aggregate_path=file_aggregate,
+    )
 
-    if len(dfs) > 0:
-        results = pd.concat(dfs, ignore_index=True)
+    if results is not None and len(results) > 0:
         print("#Results:", len(results))
-        # Cumulative: rewritten each run from the full union, so it always reflects every
-        # run in this jobdir. Overwrite, not append.
-        if jobdir_root:
-            file_aggregate = f"{dir_results}/{aggregate_name}"
-        else:
-            # No jobdir: one aggregate per run, so the timestamp is part of the name
-            stem = os.path.splitext(aggregate_name)[0] or aggregate_name
-            file_aggregate = f"{CONFIG.output.output_dir}/{stem}_{time_part}.parquet"
+        logging.info(
+            f"Aggregate: {len(results)} rows after dedupe (raw {raw_rows}, "
+            f"removed {raw_rows - len(results)})"
+        )
         results.to_parquet(file_aggregate)
+        if jobdir_root and used_files:
+            deleted = 0
+            freed = 0
+            for path in used_files:
+                try:
+                    size = os.path.getsize(path)
+                    os.remove(path)
+                    deleted += 1
+                    freed += size
+                except OSError as exc:
+                    logging.warning(f"Could not delete aggregated batch file {path}: {exc}")
+            logging.info(
+                f"Aggregate cleanup: deleted {deleted} batch files "
+                f"({freed / (1024 * 1024):.1f} MiB freed)"
+            )
 
     print("Runtime: ", end_time - start_time)

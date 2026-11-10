@@ -24,7 +24,7 @@ input:
   input_variables:
 output:
   output_dir: output
-  batchsize: 500 # Rows per intermediary parquet batch file, combined at the end
+  batchsize: 100 # Rows per intermediary parquet batch file, combined at the end
   logs: logs
   aggregate: output_scrape.parquet # Cumulative summary table, excluded from the batch read
 crawl:

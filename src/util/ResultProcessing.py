@@ -19,7 +19,7 @@ def is_valid_string(s):
 
 
 # Yields all .parquet frames in a dir (and its subdirs)
-def read_parquet_dir(parquet_dir, exclude=()):
+def read_parquet_dir(parquet_dir, exclude=(), collected=None):
     for root, dirs, files in os.walk(parquet_dir):
         for file in files:
             if file.endswith('.parquet') and file not in exclude:
@@ -28,6 +28,8 @@ def read_parquet_dir(parquet_dir, exclude=()):
                     df = pd.read_parquet(file_path)
                 except Exception:
                     continue
+                if collected is not None:
+                    collected.append(file_path)
                 if 'content' in df.columns:
                     yield df[df['content'].apply(is_valid_string)]
                 else:
