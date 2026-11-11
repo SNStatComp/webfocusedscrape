@@ -1,3 +1,4 @@
+import logging
 import os
 import sqlite3
 import threading
@@ -10,7 +11,12 @@ def canonical_url(url: str) -> str:
 
 
 class SharedVisited:
-    """Atomic visited claims shared by all batch workers."""
+    """Atomic visited claims shared by all batch workers.
+
+    One connection per process; SQLite WAL plus ``busy_timeout`` makes
+    concurrent processes safe. The connection is not shared or inherited
+    through fork; each child opens its own.
+    """
 
     def __init__(self, path: str):
         directory = os.path.dirname(path)
@@ -50,6 +56,7 @@ class SharedVisited:
             return []
 
         delay = 0.01
+        last_error = None
         for _ in range(8):
             try:
                 with self._lock:
@@ -65,6 +72,7 @@ class SharedVisited:
                     self.conn.execute("COMMIT")
                 return claimed
             except sqlite3.OperationalError as exc:
+                last_error = exc
                 try:
                     self.conn.execute("ROLLBACK")
                 except sqlite3.Error:
@@ -73,6 +81,10 @@ class SharedVisited:
                     raise
                 time.sleep(delay)
                 delay = min(delay * 2, 1.0)
+        logging.error(
+            "SharedVisited: gave up claiming %d URLs for %s after 8 attempts: %s",
+            len(pairs), base_url, last_error,
+        )
         return []
 
     def close(self):

@@ -62,6 +62,8 @@ class BatchQueue:
         temporary = f"{self.path}.tmp"
         with open(temporary, "w", encoding="utf-8") as handle:
             json.dump(data, handle)
+            handle.flush()
+            os.fsync(handle.fileno())
         os.replace(temporary, self.path)
 
     def pop(self):

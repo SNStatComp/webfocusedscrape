@@ -29,7 +29,8 @@ class PlaywrightTextFetcher:
             close_timeout: int = 10,
             page_close_timeout: float = 3.0,
             goto_timeout_ms: int = 10000,
-            fetch_timeout: float | None = 30.0):
+            fetch_timeout: float | None = 30.0,
+            recycle_wait_timeout: float = 120.0):
         logging.debug("Initializing PlaywrightTextFetcher (pooled)")
         self.user_agent = user_agent
         self.max_retries = max_retries
@@ -42,9 +43,12 @@ class PlaywrightTextFetcher:
         # indefinitely (it previously left workers hung for hours at shutdown)
         self.close_timeout = close_timeout
         # A page close must not hold a render slot indefinitely.
-        self.page_close_timeout = float(page_close_timeout)
-        self.goto_timeout_ms = int(goto_timeout_ms)
-        self.fetch_timeout = None if fetch_timeout is None else float(fetch_timeout)
+        self.page_close_timeout = page_close_timeout
+        self.goto_timeout_ms = goto_timeout_ms
+        self.fetch_timeout = None if fetch_timeout is None else fetch_timeout
+        # Bound the wait for in-flight pages before a context recycle. A leaked
+        # page must not hold the recycle lock (and the worker) forever.
+        self.recycle_wait_timeout = float(recycle_wait_timeout)
         self._page_close_timeouts = 0
         self._max_page_close_timeouts = 3
         self._force_recycle = False
@@ -114,8 +118,8 @@ class PlaywrightTextFetcher:
             await asyncio.wait_for(factory(), timeout=self.close_timeout)
         except asyncio.TimeoutError:
             logging.warning(f"Playwright {what} close timed out after {self.close_timeout}s; continuing")
-        except Exception:
-            pass
+        except Exception as exc:
+            logging.debug(f"Playwright {what} close error: {exc}")
 
     async def _safe_close_page(self, page) -> bool:
         """Close a page under a hard bound; False means the page may have leaked."""
@@ -126,13 +130,17 @@ class PlaywrightTextFetcher:
             )
             self._page_close_timeouts = 0
             return True
-        except Exception:
+        except Exception as exc:
             self._page_close_timeouts += 1
             if self._page_close_timeouts >= self._max_page_close_timeouts:
                 self._force_recycle = True
             logging.warning(
                 "Playwright page close failed or timed out after %.1fs",
                 self.page_close_timeout,
+            )
+            logging.debug(
+                "Playwright page close error for %s: %s",
+                getattr(page, "url", "?"), exc,
             )
             return False
 
@@ -164,8 +172,18 @@ class PlaywrightTextFetcher:
                 return
             # Wait for in-flight pages to close before swapping the context. Called
             # with no semaphore slot held, so the wait can actually reach zero.
-            while self._inflight > 0:
+            loop = asyncio.get_running_loop()
+            deadline = loop.time() + self.recycle_wait_timeout
+            while self._inflight > 0 and loop.time() < deadline:
                 await asyncio.sleep(0.2)
+            if self._inflight > 0:
+                logging.warning(
+                    "Playwright recycle skipped after waiting %.0fs for %d in-flight pages",
+                    self.recycle_wait_timeout, self._inflight,
+                )
+                # Do not spin on every fetch while a page stays leaked.
+                self._force_recycle = False
+                return
             logging.info(f"Recycling Playwright context after {self._fetch_count} fetches")
             await self.close()
             self._fetch_count = 0
@@ -257,7 +275,9 @@ class PlaywrightTextFetcher:
         except PlaywrightTimeoutError:
             logging.warning(f"Playwright navigation timed out for {url}; not retrying")
             return ""
-        except (PlaywrightError, Exception) as e:
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
             logging.warning(f"Playwright request failed for {url} (try {retries+1}/{self.max_retries+1}): {e}")
             if retries < self.max_retries:
                 # exponential backoff 0.5, 1.0s
