@@ -1,157 +1,28 @@
-import asyncio
-import json
 import logging
 import multiprocessing
 import os
-import random
-import re
 import sys
-import threading
 import time
-
-import pandas as pd
 
 from datetime import datetime
 from scrapy.crawler import CrawlerProcess
 
 from src.scrape import HesitantSpider
 from src.scrape.BatchQueue import BatchQueue
-from src.util import setup, normalize_url, read_parquet_dir, read_input_file
+from src.util import (
+    BatchStatusWriter,
+    classify_batch,
+    frontier_pending,
+    make_batches,
+    normalize_url,
+    read_input_file,
+    setup,
+    shuffle_urls,
+    stop_crawler_when_parent_dies,
+    write_aggregate,
+)
 
 CONFIG = setup("config/config.yaml")
-
-
-def make_batches(urls, batch_size):
-    """Split base URLs into consecutive batches."""
-    size = max(1, int(batch_size))
-    return [urls[i:i + size] for i in range(0, len(urls), size)]
-
-
-def shuffle_urls(urls, seed):
-    """Shuffle input deterministically so batch ordering is reproducible."""
-    shuffled = list(urls)
-    random.Random(int(seed)).shuffle(shuffled)
-    return shuffled
-
-
-def batch_metrics(logfile, batch_id, started_wall):
-    """Read temporary startup/page metrics from the child log."""
-    if logfile.endswith(".log"):
-        worker_log = logfile.replace(".log", f"_worker_{batch_id}.log")
-    else:
-        worker_log = f"{logfile}_worker_{batch_id}.log"
-    startup = None
-    pages = None
-    try:
-        with open(worker_log, encoding="utf-8", errors="replace") as handle:
-            for line in handle:
-                match = re.match(r"(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2})", line)
-                if match and startup is None and "Playwright browser+context pooled" in line:
-                    started = datetime.strptime(match.group(1), "%Y-%m-%d %H:%M:%S")
-                    startup = max(0.0, started.timestamp() - started_wall)
-                match = re.search(r"Crawled (\d+) pages", line)
-                if match:
-                    pages = int(match.group(1))
-    except OSError:
-        pass
-    return startup, pages
-
-
-def classify_batch(elapsed, budget, exitcode, forced=False):
-    """Classify a finished batch without retrying it."""
-    if forced or elapsed >= budget:
-        return "timeout"
-    if exitcode != 0:
-        return "error"
-    return "done"
-
-
-def frontier_pending(jobdir):
-    """Count requests persisted in a batch JOBDIR queue (0 when absent/unreadable)."""
-    if not jobdir:
-        return 0
-    queue_root = os.path.join(jobdir, "requests.queue")
-    total = 0
-    for root, _dirs, files in os.walk(queue_root):
-        if "info.json" not in files:
-            continue
-        try:
-            with open(os.path.join(root, "info.json"), encoding="utf-8") as handle:
-                total += int(json.load(handle).get("size") or 0)
-        except (OSError, ValueError, TypeError):
-            continue
-    return total
-
-
-def dedupe_results(frame):
-    """Keep one row per (base_url, url), preferring the most recent timestamp."""
-    if frame is None or len(frame) == 0:
-        return frame
-    if "timestamp" in frame.columns:
-        frame = frame.sort_values("timestamp", kind="stable")
-    return frame.drop_duplicates(subset=["base_url", "url"], keep="last").reset_index(drop=True)
-
-
-def build_aggregate(dir_results, aggregate_name, include_existing=True, aggregate_path=None):
-    """Merge the existing aggregate with new batch parquet files.
-
-    Returns ``(deduped_frame_or_None, raw_row_count, used_files)``. ``used_files``
-    lists only batch files that read successfully, so callers can delete exactly
-    what was merged and keep the crawl series cumulative.
-    """
-    frames = []
-    base_path = aggregate_path or os.path.join(dir_results, aggregate_name)
-    if include_existing and os.path.exists(base_path):
-        try:
-            frames.append(pd.read_parquet(base_path))
-        except Exception as exc:
-            logging.warning(f"Could not read existing aggregate {base_path}: {exc}")
-    used_files = []
-    frames.extend(
-        read_parquet_dir(dir_results, exclude=(aggregate_name,), collected=used_files)
-    )
-    if not frames:
-        return None, 0, used_files
-    merged = pd.concat(frames, ignore_index=True)
-    raw_rows = len(merged)
-    return dedupe_results(merged), raw_rows, used_files
-
-
-def stop_crawler_when_parent_dies(crawler, parent_read):
-    """Ask Scrapy to stop gracefully when the parent process exits.
-
-    The parent keeps the write end of a shared pipe open for its lifetime and
-    passes the read end to every child. A watcher thread blocks until the pipe
-    reports EOF (the parent's write end closed, on any OS and any death signal),
-    then schedules a graceful stop in the reactor thread. That runs the normal
-    shutdown path: drain in-flight requests, flush the output buffer, close the
-    batch JOBDIR and Playwright.
-    """
-    if parent_read is None:
-        return
-
-    def watch():
-        try:
-            from multiprocessing.connection import wait
-
-            wait([parent_read])
-        except Exception:
-            pass
-        logging.info("Parent process exited; stopping crawler")
-        try:
-            from twisted.internet import reactor
-
-            def request_stop():
-                try:
-                    asyncio.ensure_future(crawler.stop_async())
-                except Exception:
-                    os._exit(1)
-
-            reactor.callFromThread(request_stop)
-        except Exception:
-            os._exit(1)
-
-    threading.Thread(target=watch, name="parent-watch", daemon=True).start()
 
 
 # Spawn spider crawler process
@@ -406,31 +277,7 @@ if __name__ == "__main__":
     visited_db_path = os.path.join(dir_results, "visited.sqlite")
     active = {}
 
-    def record_batch(batch_id, batch, status, started, started_wall, exitcode, attempt, log_id):
-        elapsed = time.perf_counter() - started
-        startup_s, pages = batch_metrics(logfile, log_id, started_wall)
-        record = {
-            "batch_id": batch_id,
-            "attempt": attempt,
-            "base_urls": [{"url": url, "status": status} for url in batch],
-            "status": status,
-            "started_at": datetime.fromtimestamp(started_wall).isoformat(timespec="seconds"),
-            "ended_at": datetime.now().isoformat(timespec="seconds"),
-            "elapsed_s": round(elapsed, 1),
-            "startup_s": None if startup_s is None else round(startup_s, 1),
-            "pages": pages,
-            "exitcode": exitcode,
-            "frontier_pending": frontier_pending(
-                f"{jobdir_root}/batch_{batch_id}" if jobdir_root else None
-            ),
-        }
-        with open(status_path, "a", encoding="utf-8") as handle:
-            handle.write(json.dumps(record) + "\n")
-        logging.info(
-            f"Batch {batch_id} {status}: {len(batch)} URLs, "
-            f"{elapsed:.1f}s, startup={startup_s}, pages={pages}, exitcode={exitcode}"
-        )
-        print(f"Batch {batch_id} {status}: {len(batch)} URLs, {elapsed:.1f}s")
+    batch_status = BatchStatusWriter(status_path, jobdir_root)
 
     start_time = time.perf_counter()
     run_deadline = start_time + max_run_duration if max_run_duration > 0 else None
@@ -463,9 +310,9 @@ if __name__ == "__main__":
                     if proc.is_alive():
                         proc.kill()
                         proc.join(timeout=5)
-                    record_batch(
+                    batch_status.record(
                         batch_id, batch, "cutoff", started, started_wall,
-                        proc.exitcode, attempt, log_id,
+                        proc.exitcode, attempt,
                     )
                     batch_queue.finish(batch_id, "cutoff")
                     del active[pid]
@@ -550,9 +397,9 @@ if __name__ == "__main__":
                 status = classify_batch(
                     elapsed, batch_budget, proc.exitcode, forced
                 )
-                record_batch(
+                batch_status.record(
                     batch_id, batch, status, started, started_wall,
-                    proc.exitcode, attempt, log_id,
+                    proc.exitcode, attempt,
                 )
                 batch_queue.finish(batch_id, status)
                 del active[pid]
@@ -582,32 +429,9 @@ if __name__ == "__main__":
         stem = os.path.splitext(aggregate_name)[0] or aggregate_name
         file_aggregate = f"{CONFIG.output.output_dir}/{stem}_{time_part}.parquet"
 
-    results, raw_rows, used_files = build_aggregate(
-        dir_results, aggregate_name, include_existing=bool(jobdir_root),
-        aggregate_path=file_aggregate,
+    write_aggregate(
+        dir_results, aggregate_name, file_aggregate,
+        include_existing=bool(jobdir_root), cleanup=bool(jobdir_root),
     )
-
-    if results is not None and len(results) > 0:
-        print("#Results:", len(results))
-        logging.info(
-            f"Aggregate: {len(results)} rows after dedupe (raw {raw_rows}, "
-            f"removed {raw_rows - len(results)})"
-        )
-        results.to_parquet(file_aggregate)
-        if jobdir_root and used_files:
-            deleted = 0
-            freed = 0
-            for path in used_files:
-                try:
-                    size = os.path.getsize(path)
-                    os.remove(path)
-                    deleted += 1
-                    freed += size
-                except OSError as exc:
-                    logging.warning(f"Could not delete aggregated batch file {path}: {exc}")
-            logging.info(
-                f"Aggregate cleanup: deleted {deleted} batch files "
-                f"({freed / (1024 * 1024):.1f} MiB freed)"
-            )
 
     print("Runtime: ", end_time - start_time)
